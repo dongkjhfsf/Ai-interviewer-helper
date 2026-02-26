@@ -4,12 +4,23 @@ CREATE TABLE IF NOT EXISTS modules (
   description TEXT
 );
 
-CREATE TABLE IF NOT EXISTS questions (
+CREATE TABLE IF NOT EXISTS question_batches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   module_id TEXT,
+  title TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(module_id) REFERENCES modules(id)
+);
+
+CREATE TABLE IF NOT EXISTS questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER,
+  module_id TEXT,
   content TEXT NOT NULL,
+  answer TEXT,
   difficulty TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(batch_id) REFERENCES question_batches(id) ON DELETE CASCADE,
   FOREIGN KEY(module_id) REFERENCES modules(id)
 );
 
@@ -19,6 +30,25 @@ CREATE TABLE IF NOT EXISTS sessions (
   start_time DATETIME DEFAULT CURRENT_TIMESTAMP,
   end_time DATETIME,
   transcript_text TEXT
+);
+
+CREATE TABLE IF NOT EXISTS interview_practices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL,
+  transcript_text TEXT NOT NULL,
+  duration_seconds INTEGER,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(batch_id) REFERENCES question_batches(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS api_providers (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  api_key TEXT NOT NULL,
+  base_url TEXT,
+  is_active INTEGER DEFAULT 1,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 INSERT OR IGNORE INTO modules (id, name, description) VALUES 
