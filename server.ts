@@ -32,8 +32,26 @@ async function startServer() {
 
   app.get("/api/questions/history", (req, res) => {
     try {
-      const questions = db.prepare('SELECT * FROM questions ORDER BY id DESC LIMIT 100').all();
-      res.json({ questions });
+      // Group questions by their creation timestamp (which is identical for a batch inserted in a transaction)
+      const query = `
+        SELECT 
+          created_at, 
+          module_id, 
+          json_group_array(json_object('id', id, 'content', content, 'difficulty', difficulty)) as questions_json
+        FROM questions 
+        GROUP BY created_at, module_id 
+        ORDER BY created_at DESC 
+        LIMIT 50
+      `;
+      const batches = db.prepare(query).all() as any[];
+      
+      const formattedBatches = batches.map(batch => ({
+        created_at: batch.created_at,
+        module_id: batch.module_id,
+        questions: JSON.parse(batch.questions_json)
+      }));
+
+      res.json({ batches: formattedBatches });
     } catch (error) {
       console.error("Error fetching history:", error);
       res.status(500).json({ error: "Failed to fetch history" });

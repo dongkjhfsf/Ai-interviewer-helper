@@ -1,9 +1,24 @@
 import React from 'react';
 import { motion } from 'motion/react';
-import { Printer, Play, CheckCircle2 } from 'lucide-react';
+import { Download, Play, CheckCircle2 } from 'lucide-react';
 
 export default function QuestionList({ data, onStart }: { data: any, onStart: () => void }) {
   const questions = data?.questions || [];
+
+  const handleExportMd = () => {
+    const mdContent = `# Interview Question Set\n\nGenerated at: ${new Date().toLocaleString()}\n\n` + 
+      questions.map((q: any, i: number) => `### ${i + 1}. [${q.difficulty}] \n${q.content}\n`).join('\n');
+    
+    const blob = new Blob([mdContent], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `interview-set-${new Date().getTime()}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <div className="min-h-screen bg-[#faf9f6] text-zinc-900 p-8 md:p-16">
@@ -24,11 +39,11 @@ export default function QuestionList({ data, onStart }: { data: any, onStart: ()
           
           <div className="flex gap-3">
             <button 
-              onClick={() => window.print()}
+              onClick={handleExportMd}
               className="px-6 py-3 rounded-full border border-zinc-200 hover:border-zinc-300 bg-white flex items-center gap-2 text-sm font-medium transition-all"
             >
-              <Printer className="w-4 h-4" />
-              Print List
+              <Download className="w-4 h-4" />
+              Export to MD
             </button>
             <button 
               onClick={onStart}
