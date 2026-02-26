@@ -1,0 +1,5 @@
+{
+  "name": "AI Mock Interviewer",
+  "description": "A comprehensive AI-powered mock interview platform featuring real-time voice interaction, resume analysis, and adaptive questioning modules.",
+  "requestFramePermissions": ["microphone"]
+}
