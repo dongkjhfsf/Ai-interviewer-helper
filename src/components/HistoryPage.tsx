@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { ArrowLeft, Database, Clock, Trash2, ChevronRight, Download, ChevronDown, FileText } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface QuestionItemProps {
   question: any;
@@ -477,8 +479,12 @@ function QuestionItem({ question, index }: QuestionItemProps) {
               animate={{ height: 'auto', opacity: 1 }}
               className="mt-4 pt-4 border-t border-zinc-200"
             >
-              <div className="text-zinc-600 leading-relaxed whitespace-pre-wrap text-sm bg-white p-6 rounded-2xl border border-zinc-100">
-                {question.answer || '暂无答案解析。'}
+              <div className="prose prose-sm prose-zinc max-w-none bg-white p-6 rounded-2xl border border-zinc-100 [&_pre]:bg-zinc-50 [&_pre]:rounded-xl [&_pre]:p-4 [&_pre]:overflow-x-auto [&_code]:text-orange-600 [&_code]:text-xs [&_pre_code]:text-zinc-700 [&_pre_code]:text-xs [&_h1]:text-lg [&_h2]:text-base [&_h3]:text-sm [&_ul]:my-2 [&_ol]:my-2 [&_li]:my-0.5 [&_p]:my-2 [&_table]:text-xs [&_th]:px-3 [&_th]:py-1.5 [&_td]:px-3 [&_td]:py-1.5 [&_blockquote]:border-orange-300 [&_blockquote]:text-zinc-500 [&_a]:text-orange-600">
+                {question.answer ? (
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{question.answer}</ReactMarkdown>
+                ) : (
+                  <p className="text-zinc-400 italic">暂无答案解析。</p>
+                )}
               </div>
             </motion.div>
           )}

@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, MicOff, Square, Loader2, MessageSquare, ShieldAlert, BrainCircuit, AudioLines, Ear, Sparkles } from 'lucide-react';
+import { Mic, MicOff, Square, Loader2, MessageSquare, ShieldAlert, BrainCircuit, AudioLines, Ear, Sparkles, Volume2, Settings2, CheckCheck, X, Send } from 'lucide-react';
 import { GoogleGenAI, LiveServerMessage, Modality, StartSensitivity, EndSensitivity } from '@google/genai';
 
 // AI Status types for the status bar
@@ -73,6 +73,15 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
   const [micVolume, setMicVolume] = useState(0);
   const [aiStatus, setAiStatus] = useState<AIStatus>('connecting');
   const [elapsedTime, setElapsedTime] = useState(0);
+  const [micDeviceName, setMicDeviceName] = useState<string>('检测中...');
+  const [showMicTest, setShowMicTest] = useState(false);
+  const [micPeakVolume, setMicPeakVolume] = useState(0);
+  const [micTestStatus, setMicTestStatus] = useState<'idle' | 'good' | 'low' | 'silent'>('idle');
+  const [showEndConfirm, setShowEndConfirm] = useState(false);
+  const [reconnectCountdown, setReconnectCountdown] = useState<number | null>(null);
+  const reconnectCountdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const micPeakTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const micPeakRef = useRef(0);
 
   const sessionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -109,6 +118,10 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
   const pendingAiTextRef = useRef('');
   const pendingUserTextRef = useRef('');
 
+  // Live/streaming preview of in-progress transcription (shown as draft bubbles)
+  const [liveUserText, setLiveUserText] = useState('');
+  const [liveAiText, setLiveAiText] = useState('');
+
   // Track the current "who is talking" state for ordering
   // 'model' = AI is currently generating a turn, 'user' = user just spoke
   const currentTurnRoleRef = useRef<'model' | 'user' | null>(null);
@@ -116,10 +129,10 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
   const questions = data?.questions || [];
   const questionsContext = questions.map((q: any, i: number) => `${i + 1}. [${q.difficulty}] ${q.content}`).join('\n');
 
-  // Auto scroll transcript
+  // Auto scroll transcript — also triggered by live bubble updates
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [transcript]);
+  }, [transcript, liveUserText, liveAiText]);
 
   // Timer
   useEffect(() => {
@@ -132,7 +145,7 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
     };
   }, []);
 
-  // Mic volume animation
+  // Mic volume animation + peak tracking for mic test
   const updateVolume = useCallback(() => {
     if (analyserRef.current) {
       const dataArray = new Uint8Array(analyserRef.current.fftSize);
@@ -143,10 +156,40 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
         sum += v * v;
       }
       const rms = Math.sqrt(sum / dataArray.length);
-      setMicVolume(Math.min(255, rms * 512));
+      const vol = Math.min(255, rms * 512);
+      setMicVolume(vol);
+      // Track peak for mic test
+      if (vol > micPeakRef.current) micPeakRef.current = vol;
     }
     animationRef.current = requestAnimationFrame(updateVolume);
   }, []);
+
+  // Mic test: periodically sample peak volume to give user feedback
+  useEffect(() => {
+    if (showMicTest) {
+      micPeakRef.current = 0;
+      micPeakTimerRef.current = setInterval(() => {
+        const peak = micPeakRef.current;
+        setMicPeakVolume(peak);
+        if (peak > 30) setMicTestStatus('good');
+        else if (peak > 5) setMicTestStatus('low');
+        else setMicTestStatus('silent');
+        micPeakRef.current = 0;
+      }, 500);
+    } else {
+      if (micPeakTimerRef.current) {
+        clearInterval(micPeakTimerRef.current);
+        micPeakTimerRef.current = null;
+      }
+      setMicTestStatus('idle');
+    }
+    return () => {
+      if (micPeakTimerRef.current) {
+        clearInterval(micPeakTimerRef.current);
+        micPeakTimerRef.current = null;
+      }
+    };
+  }, [showMicTest]);
 
   useEffect(() => {
     startSession();
@@ -156,21 +199,45 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
     };
   }, []);
 
+  // Sanitize transcription output: remove glitch artifacts (repeated chars, unusual codepoints)
+  const sanitizeTranscript = (text: string): string => {
+    if (!text) return text;
+    // Remove any character repeated 7+ times consecutively (API noise artifact)
+    let result = text.replace(/(.)(\1){6,}/g, '');
+    // Keep only: ASCII printable, extended Latin, common CJK punctuation,
+    // Hiragana/Katakana (often mixed), CJK unified, fullwidth, newlines.
+    // Strip anything else (Thai, symbols, Devanagari etc — not expected in zh/en output)
+    result = result.replace(
+      /[^\u0020-\u007E\u00A0-\u024F\u2013-\u2026\u3000-\u303F\u3041-\u30FF\u4E00-\u9FFF\uFF00-\uFFEF\n]/g,
+      ''
+    );
+    return result.trim();
+  };
+
   // Helper: flush pending user text into transcript
-  const flushPendingUserText = () => {
-    if (pendingUserTextRef.current.trim()) {
-      const text = pendingUserTextRef.current.trim();
-      setTranscript(prev => [...prev, { role: 'user', text }]);
-      pendingUserTextRef.current = '';
+  // When user text is flushed because AI model is starting to respond,
+  // show 'thinking' status so users know their input was received.
+  const flushPendingUserText = (triggerThinking = false) => {
+    const raw = pendingUserTextRef.current.trim();
+    pendingUserTextRef.current = '';
+    setLiveUserText('');
+    if (raw) {
+      const text = sanitizeTranscript(raw);
+      if (text) {
+        setTranscript(prev => [...prev, { role: 'user', text }]);
+        if (triggerThinking) setAiStatus('thinking');
+      }
     }
   };
 
   // Helper: flush pending AI text into transcript
   const flushPendingAiText = (suffix?: string) => {
-    if (pendingAiTextRef.current.trim()) {
-      const text = pendingAiTextRef.current.trim() + (suffix || '');
-      setTranscript(prev => [...prev, { role: 'ai', text }]);
-      pendingAiTextRef.current = '';
+    const raw = pendingAiTextRef.current.trim() + (suffix || '');
+    pendingAiTextRef.current = '';
+    setLiveAiText('');
+    if (raw.trim()) {
+      const text = sanitizeTranscript(raw.trim());
+      if (text) setTranscript(prev => [...prev, { role: 'ai', text }]);
     }
   };
 
@@ -178,6 +245,20 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
     const currentSession = sessionRef.current;
     sessionRef.current = null;
     isSessionOpenRef.current = false;
+
+    // Reset pending text to avoid leaking partial transcription across sessions
+    pendingUserTextRef.current = '';
+    pendingAiTextRef.current = '';
+    currentTurnRoleRef.current = null;
+    setLiveUserText('');
+    setLiveAiText('');
+
+    // Clear reconnect countdown
+    if (reconnectCountdownRef.current) {
+      clearInterval(reconnectCountdownRef.current);
+      reconnectCountdownRef.current = null;
+    }
+    setReconnectCountdown(null);
 
     if (workletNodeRef.current) {
       workletNodeRef.current.disconnect();
@@ -235,14 +316,44 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
     }
 
     reconnectAttemptsRef.current = attempt;
-    const delay = Math.min(5000, attempt * 1000);
-    setError(`连接中断（${reason}），${Math.ceil(delay / 1000)}秒后重连...`);
+    const delaySeconds = Math.min(5, attempt);
+    const delayMs = delaySeconds * 1000;
     setAiStatus('connecting');
+
+    // Start a real countdown
+    if (reconnectCountdownRef.current) clearInterval(reconnectCountdownRef.current);
+    setReconnectCountdown(delaySeconds);
+    let remaining = delaySeconds;
+    reconnectCountdownRef.current = setInterval(() => {
+      remaining -= 1;
+      setReconnectCountdown(remaining);
+      if (remaining <= 0) {
+        if (reconnectCountdownRef.current) clearInterval(reconnectCountdownRef.current);
+        reconnectCountdownRef.current = null;
+        setReconnectCountdown(null);
+      }
+    }, 1000);
+
+    setError(`连接中断（${reason}），正在重连...`);
 
     reconnectTimerRef.current = setTimeout(() => {
       reconnectTimerRef.current = null;
       startSession();
-    }, delay);
+    }, delayMs);
+  };
+
+  // Force-end user's speech turn: signals VAD to stop waiting and trigger AI response immediately
+  const handleFinishSpeaking = () => {
+    if (!sessionRef.current || !isSessionOpenRef.current) return;
+    try {
+      sessionRef.current.sendRealtimeInput({ audioStreamEnd: true });
+      // Re-enable mic stream immediately after (so AI echo cancellation keeps working)
+      // The stream end only signals the end of this speech segment
+      // Setting thinking gives immediate visual feedback that AI received the input
+      if (pendingUserTextRef.current.trim() || liveUserText.trim()) {
+        setAiStatus('thinking');
+      }
+    } catch (_) {}
   };
 
   const pcmToBase64 = (pcmData: Int16Array) => {
@@ -286,6 +397,20 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
           autoGainControl: false,
         }
       });
+
+      // Detect and display active microphone device name
+      const audioTrack = mediaStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        const settings = audioTrack.getSettings();
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const inputDevices = devices.filter(d => d.kind === 'audioinput');
+          const activeDevice = inputDevices.find(d => d.deviceId === settings.deviceId);
+          setMicDeviceName(activeDevice?.label || audioTrack.label || '未知设备');
+        } catch {
+          setMicDeviceName(audioTrack.label || '未知设备');
+        }
+      }
 
       const source = audioContextRef.current.createMediaStreamSource(mediaStreamRef.current);
 
@@ -355,8 +480,9 @@ ${questionsContext}
               // Extra padding before confirming speech start (ms)
               prefixPaddingMs: 100,
               // How long to wait in silence before considering speech ended (ms)
-              // 2000ms = 2 seconds of silence required before the AI will respond
-              silenceDurationMs: 2000,
+              // 3000ms = 3 seconds of silence required before the AI will respond
+              // Increased from 2000ms to better support stuttering/hesitating speakers
+              silenceDurationMs: 3000,
             },
           },
         },
@@ -414,7 +540,10 @@ ${questionsContext}
       processor.onaudioprocess = (e) => {
         if (runId !== sessionRunIdRef.current || sessionRef.current !== session) return;
         if (!isSessionOpenRef.current) return;
-        if (isMutedRef.current || isSpeakingRef.current) return;
+        if (isMutedRef.current) return;
+        // NOTE: Do NOT gate on isSpeakingRef — the Gemini Live API requires
+        // a continuous audio stream for its server-side VAD to function.
+        // Browser echoCancellation handles feedback prevention.
 
         const inputData = e.inputBuffer.getChannelData(0);
 
@@ -507,13 +636,16 @@ ${questionsContext}
       }
       currentTurnRoleRef.current = 'user';
       pendingUserTextRef.current += sc.inputTranscription.text;
+      // Update live preview so user can see real-time transcription as they speak
+      setLiveUserText(pendingUserTextRef.current);
     }
 
     // Handle model audio output
     if (sc.modelTurn?.parts) {
       // If user text is pending (from before this model turn), flush it first
+      // and show 'thinking' to indicate AI received the input and is processing
       if (currentTurnRoleRef.current !== 'model') {
-        flushPendingUserText();
+        flushPendingUserText(true);
         currentTurnRoleRef.current = 'model';
       }
 
@@ -530,10 +662,12 @@ ${questionsContext}
     if (sc.outputTranscription?.text) {
       // Ensure user text is flushed before appending model text
       if (currentTurnRoleRef.current !== 'model') {
-        flushPendingUserText();
+        flushPendingUserText(true);
         currentTurnRoleRef.current = 'model';
       }
       pendingAiTextRef.current += sc.outputTranscription.text;
+      // Update live preview so AI response text streams in real-time
+      setLiveAiText(pendingAiTextRef.current);
     }
 
     // Handle turn complete
@@ -624,13 +758,17 @@ ${questionsContext}
   const handleEndInterview = () => {
     const finalMessages = [...transcript];
     if (pendingUserTextRef.current.trim()) {
-      finalMessages.push({ role: 'user' as const, text: pendingUserTextRef.current.trim() });
+      const text = sanitizeTranscript(pendingUserTextRef.current.trim());
+      if (text) finalMessages.push({ role: 'user' as const, text });
       pendingUserTextRef.current = '';
     }
     if (pendingAiTextRef.current.trim()) {
-      finalMessages.push({ role: 'ai' as const, text: pendingAiTextRef.current.trim() });
+      const text = sanitizeTranscript(pendingAiTextRef.current.trim());
+      if (text) finalMessages.push({ role: 'ai' as const, text });
       pendingAiTextRef.current = '';
     }
+    setLiveUserText('');
+    setLiveAiText('');
     setTranscript(finalMessages);
 
     stopSession();
@@ -685,24 +823,61 @@ ${questionsContext}
           </div>
         </div>
 
-        <button
-          onClick={handleEndInterview}
-          className="px-5 py-2.5 bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-full text-sm font-medium transition-all duration-300 flex items-center gap-2 border border-red-500/20 hover:border-red-500/30"
-        >
-          <Square className="w-3.5 h-3.5" />
-          结束面试
-        </button>
+        <AnimatePresence mode="wait">
+          {showEndConfirm ? (
+            <motion.div
+              key="confirm"
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              transition={{ duration: 0.15 }}
+              className="flex items-center gap-2"
+            >
+              <span className="text-xs text-zinc-400 mr-1">确认结束本次面试？</span>
+              <button
+                onClick={handleEndInterview}
+                className="px-4 py-2 bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-full text-sm font-medium transition-all flex items-center gap-1.5 border border-red-500/30"
+              >
+                <CheckCheck className="w-3.5 h-3.5" />
+                确认结束
+              </button>
+              <button
+                onClick={() => setShowEndConfirm(false)}
+                className="px-4 py-2 bg-white/5 text-zinc-400 hover:bg-white/10 rounded-full text-sm font-medium transition-all flex items-center gap-1.5 border border-white/10"
+              >
+                <X className="w-3.5 h-3.5" />
+                继续面试
+              </button>
+            </motion.div>
+          ) : (
+            <motion.button
+              key="end"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              whileHover={{ scale: 1.03 }}
+              whileTap={{ scale: 0.97 }}
+              onClick={() => setShowEndConfirm(true)}
+              className="px-5 py-2.5 bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-full text-sm font-medium transition-all duration-300 flex items-center gap-2 border border-red-500/20 hover:border-red-500/30"
+            >
+              <Square className="w-3.5 h-3.5" />
+              结束面试
+            </motion.button>
+          )}
+        </AnimatePresence>
       </header>
 
       {/* AI Status Bar */}
       <AnimatePresence mode="wait">
         <motion.div
-          key={aiStatus}
+          key={isMuted ? 'muted' : aiStatus}
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
           exit={{ opacity: 0, y: -10 }}
           transition={{ duration: 0.3, ease: 'easeOut' }}
-          className={`px-6 py-3 border-b border-white/5 flex items-center justify-center gap-3 ${currentStatus.bgColor}`}
+          className={`px-6 py-3 border-b border-white/5 flex items-center justify-center gap-3 ${
+            isMuted ? 'bg-zinc-500/10' : currentStatus.bgColor
+          }`}
         >
           {/* Pulse indicator */}
           <div className="relative flex items-center">
@@ -712,15 +887,32 @@ ${questionsContext}
                 opacity: [0.6, 0, 0.6],
               }}
               transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
-              className={`absolute w-3 h-3 rounded-full ${currentStatus.pulseColor} opacity-30`}
+              className={`absolute w-3 h-3 rounded-full ${
+                isMuted ? 'bg-zinc-500' : currentStatus.pulseColor
+              } opacity-30`}
             />
-            <div className={`w-2 h-2 rounded-full ${currentStatus.pulseColor} relative z-10`} />
+            <div className={`w-2 h-2 rounded-full ${
+              isMuted ? 'bg-zinc-500' : currentStatus.pulseColor
+            } relative z-10`} />
           </div>
 
-          <span className={`${currentStatus.color} flex items-center gap-2 text-sm font-medium`}>
-            {currentStatus.icon}
-            {currentStatus.label}
-          </span>
+          {isMuted ? (
+            <span className="text-zinc-400 flex items-center gap-2 text-sm font-medium">
+              <MicOff className="w-4 h-4" />
+              麦克风已静音·AI 暂时听不到您
+            </span>
+          ) : (
+            <span className={`${currentStatus.color} flex items-center gap-2 text-sm font-medium`}>
+              {currentStatus.icon}
+              {currentStatus.label}
+              {/* Reconnect countdown badge */}
+              {reconnectCountdown !== null && (
+                <span className="ml-1 text-xs font-mono bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full border border-amber-500/30">
+                  {reconnectCountdown}s
+                </span>
+              )}
+            </span>
+          )}
 
           {/* Speaking waveform animation */}
           {aiStatus === 'speaking' && (
@@ -894,11 +1086,19 @@ ${questionsContext}
                 className="mt-6 p-4 bg-red-500/10 border border-red-500/20 rounded-xl flex items-start gap-3 text-left max-w-sm mx-auto"
               >
                 <ShieldAlert className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-                <p className="text-sm text-red-200">{error}</p>
+                <div className="flex-1">
+                  <p className="text-sm text-red-200">{error}</p>
+                  {reconnectCountdown !== null && (
+                    <p className="text-xs text-amber-400 mt-1 font-mono">
+                      {reconnectCountdown > 0 ? `· ${reconnectCountdown} 秒后自动重连` : '· 重连中...'}
+                    </p>
+                  )}
+                </div>
               </motion.div>
             )}
 
-            <div className="mt-10 flex justify-center gap-4">
+            <div className="mt-10 flex flex-col items-center gap-4">
+              <div className="flex justify-center gap-4">
               <motion.button
                 whileHover={{ scale: 1.05 }}
                 whileTap={{ scale: 0.95 }}
@@ -912,7 +1112,111 @@ ${questionsContext}
               >
                 {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
               </motion.button>
+
+              <motion.button
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+                onClick={() => setShowMicTest(prev => !prev)}
+                className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300 shadow-lg border ${
+                  showMicTest
+                    ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/30'
+                    : 'bg-white/5 text-zinc-400 border-white/10 hover:bg-white/10'
+                }`}
+                title="麦克风测试"
+              >
+                <Settings2 className="w-6 h-6" />
+              </motion.button>
+              </div>
+
+              {/* 我说完了 button — visible when listening and mic is active */}
+              <AnimatePresence>
+                {isConnected && !isMuted && (aiStatus === 'listening' || aiStatus === 'interrupted') && (
+                  <motion.button
+                    key="finish-speaking"
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 8 }}
+                    transition={{ duration: 0.25 }}
+                    whileHover={{ scale: 1.03 }}
+                    whileTap={{ scale: 0.97 }}
+                    onClick={handleFinishSpeaking}
+                    className="px-5 py-2.5 bg-green-500/10 hover:bg-green-500/20 text-green-400 border border-green-500/20 hover:border-green-500/30 rounded-full text-sm font-medium transition-all flex items-center gap-2"
+                    title="单击通知 AI 您已说完，无需等待静音超时"
+                  >
+                    <Send className="w-4 h-4" />
+                    我说完了
+                  </motion.button>
+                )}
+              </AnimatePresence>
             </div>
+
+            {/* Mic Info & Test Panel */}
+            <AnimatePresence>
+              {showMicTest && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10, height: 0 }}
+                  animate={{ opacity: 1, y: 0, height: 'auto' }}
+                  exit={{ opacity: 0, y: 10, height: 0 }}
+                  transition={{ duration: 0.3 }}
+                  className="mt-6 max-w-sm mx-auto overflow-hidden"
+                >
+                  <div className="p-4 bg-white/5 border border-white/10 rounded-xl space-y-4">
+                    {/* Device name */}
+                    <div className="flex items-center gap-2">
+                      <Mic className="w-4 h-4 text-zinc-400 shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[10px] uppercase tracking-widest text-zinc-500 mb-0.5">当前麦克风</p>
+                        <p className="text-xs text-zinc-300 truncate" title={micDeviceName}>{micDeviceName}</p>
+                      </div>
+                    </div>
+
+                    {/* Real-time volume meter */}
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-[10px] uppercase tracking-widest text-zinc-500 flex items-center gap-1">
+                          <Volume2 className="w-3 h-3" />
+                          实时音量
+                        </span>
+                        <span className={`text-[10px] font-bold uppercase tracking-wide ${
+                          micTestStatus === 'good' ? 'text-green-400' :
+                          micTestStatus === 'low' ? 'text-amber-400' :
+                          micTestStatus === 'silent' ? 'text-red-400' : 'text-zinc-500'
+                        }`}>
+                          {micTestStatus === 'good' ? '✓ 正常' :
+                           micTestStatus === 'low' ? '⚠ 音量偏低' :
+                           micTestStatus === 'silent' ? '✗ 未检测到声音' : '等待中...'}
+                        </span>
+                      </div>
+
+                      {/* Volume bar */}
+                      <div className="h-3 bg-black/40 rounded-full overflow-hidden border border-white/5">
+                        <motion.div
+                          className={`h-full rounded-full ${
+                            micVolume > 30 ? 'bg-gradient-to-r from-green-500 to-green-400' :
+                            micVolume > 5 ? 'bg-gradient-to-r from-amber-500 to-amber-400' :
+                            'bg-red-500/50'
+                          }`}
+                          animate={{ width: `${Math.min(100, (micVolume / 255) * 100)}%` }}
+                          transition={{ duration: 0.05 }}
+                        />
+                      </div>
+
+                      {/* Scale markers */}
+                      <div className="flex justify-between mt-1">
+                        <span className="text-[9px] text-zinc-600">静音</span>
+                        <span className="text-[9px] text-zinc-600">正常</span>
+                        <span className="text-[9px] text-zinc-600">大声</span>
+                      </div>
+                    </div>
+
+                    {/* Mic test tip */}
+                    <p className="text-[11px] text-zinc-500 leading-relaxed">
+                      💡 对着麦克风说几句话，观察音量条是否有变化。绿色表示正常，如果一直红色说明麦克风未接收到声音。
+                    </p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         </div>
 
@@ -964,6 +1268,69 @@ ${questionsContext}
                 </div>
               </motion.div>
             ))}
+
+            {/* Live user transcription draft bubble — shown in real-time as user speaks */}
+            <AnimatePresence>
+              {liveUserText.trim() && (
+                <motion.div
+                  key="live-user"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 5 }}
+                  transition={{ duration: 0.2 }}
+                  className="flex flex-col items-end"
+                >
+                  <span className="text-[10px] uppercase tracking-widest mb-1.5 font-semibold text-orange-400/50 flex items-center gap-1">
+                    👤 你
+                    <span className="inline-flex items-center gap-0.5 ml-1">
+                      {[0,1,2].map(i => (
+                        <motion.span
+                          key={i}
+                          animate={{ opacity: [0.3, 1, 0.3] }}
+                          transition={{ duration: 0.8, repeat: Infinity, delay: i * 0.2 }}
+                          className="w-1 h-1 bg-orange-400/60 rounded-full inline-block"
+                        />
+                      ))}
+                    </span>
+                  </span>
+                  <div className="p-4 rounded-2xl max-w-[90%] text-sm leading-relaxed bg-orange-500/8 border border-orange-500/15 text-orange-100/60 rounded-tr-sm italic">
+                    {sanitizeTranscript(liveUserText) || liveUserText}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Live AI transcription draft bubble — streams in as AI speaks */}
+            <AnimatePresence>
+              {liveAiText.trim() && (
+                <motion.div
+                  key="live-ai"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 5 }}
+                  transition={{ duration: 0.2 }}
+                  className="flex flex-col items-start"
+                >
+                  <span className="text-[10px] uppercase tracking-widest mb-1.5 font-semibold text-blue-400/50 flex items-center gap-1">
+                    🤖 面试官
+                    <span className="inline-flex items-center gap-0.5 ml-1">
+                      {[0,1,2].map(i => (
+                        <motion.span
+                          key={i}
+                          animate={{ opacity: [0.3, 1, 0.3] }}
+                          transition={{ duration: 0.8, repeat: Infinity, delay: i * 0.2 }}
+                          className="w-1 h-1 bg-blue-400/60 rounded-full inline-block"
+                        />
+                      ))}
+                    </span>
+                  </span>
+                  <div className="p-4 rounded-2xl max-w-[90%] text-sm leading-relaxed bg-white/4 border border-white/8 text-zinc-400/80 rounded-tl-sm italic">
+                    {sanitizeTranscript(liveAiText) || liveAiText}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
             <div ref={transcriptEndRef} />
           </div>
         </div>

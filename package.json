@@ -1,17 +1,29 @@
 {
-  "name": "react-example",
+  "name": "ai-interviewer",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "start": "NODE_ENV=production tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "pm2:start": "pm2 start ecosystem.config.cjs --env production",
+    "pm2:dev": "pm2 start ecosystem.config.cjs --env development --watch src server.ts",
+    "pm2:stop": "pm2 stop jobinterviewer",
+    "pm2:restart": "pm2 restart jobinterviewer",
+    "pm2:reload": "pm2 reload jobinterviewer",
+    "pm2:delete": "pm2 delete jobinterviewer",
+    "pm2:logs": "pm2 logs jobinterviewer",
+    "pm2:status": "pm2 show jobinterviewer",
+    "pm2:save": "pm2 save",
+    "pm2:monit": "pm2 monit"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
+    "@tailwindcss/typography": "^0.5.19",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
     "better-sqlite3": "^12.4.1",
@@ -22,6 +34,8 @@
     "multer": "^2.0.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "vite": "^6.2.0"
   },
   "devDependencies": {

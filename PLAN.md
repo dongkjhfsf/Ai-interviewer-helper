@@ -1,4 +1,4 @@
-# AI Mock Interviewer - Project Implementation Outline
+# AI Interviewer - Project Implementation Outline
 
 ## 1. Architecture & Infrastructure
 - **Stack**: React (Frontend) + Express (Backend) + SQLite (Database).

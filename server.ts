@@ -49,12 +49,14 @@ function isTransientGoogleConnectionError(error: any): boolean {
   );
 }
 
-function toClientSafeErrorMessage(error: any): string {
+function toClientSafeErrorMessage(error: any, providerName = "AI"): string {
   const detail = getErrorDetail(error);
-  if (detail.toLowerCase().includes("fetch failed")) {
-    return "Google Gemini request failed due to a transient network/gateway issue. Please retry or switch to gemini-2.5-flash-lite.";
+  if (detail.toLowerCase().includes("fetch failed") || detail.toLowerCase().includes("econnreset") || detail.toLowerCase().includes("timed out") || detail.toLowerCase().includes("aborted")) {
+    return `${providerName} 请求失败（网络/网关问题）。请重试或切换其他模型。`;
   }
-  return error?.message || "Failed to generate questions";
+  // Strip internal stack traces, keep the human-readable part
+  const msg = error?.message || "Failed to generate questions";
+  return msg.length > 300 ? msg.slice(0, 300) + "..." : msg;
 }
 
 const JSON_INSTRUCTION = `\n\nYou MUST respond with ONLY a valid JSON object (no markdown fences, no extra text). The JSON structure must be:
@@ -65,10 +67,22 @@ const JSON_INSTRUCTION = `\n\nYou MUST respond with ONLY a valid JSON object (no
       "content": "the interview question",
       "difficulty": "Easy | Medium | Hard",
       "category": "topic category",
-      "answer": "the perfect referral answer"
+      "answer": "the perfect referral answer (MUST be well-formatted Markdown)"
     }
   ]
-}`;
+}
+
+CRITICAL — Answer formatting rules (apply to every "answer" field):
+- Use Markdown headings (##, ###) to separate major sections of the answer.
+- Use **bold** for key terms, concepts, or takeaways on first mention.
+- Use bullet lists (- ) or numbered lists (1. ) for enumerating points; NEVER write a wall of plain text.
+- Use inline \`code\` for technical identifiers (function names, classes, commands, config keys).
+- Use fenced code blocks (\`\`\`lang) for any code snippets, SQL, shell commands, or config examples.
+- Use > blockquotes for important caveats or notes.
+- Use tables (| col | col |) when comparing alternatives or listing attributes.
+- Keep paragraphs short (2-3 sentences max). Insert blank lines between sections.
+- Structure longer answers as: core concept → mechanism/principle → example/code → edge cases/caveats.
+- The answer string must be valid Markdown that renders cleanly.`;
 
 const DEFAULT_SYSTEM_PROMPT = `You are an expert, rigorous technical interviewer.
 Hard requirements:
@@ -76,7 +90,7 @@ Hard requirements:
 - Return exactly 15 questions.
 - Difficulty must progress from Easy to Hard.
 - Avoid semantic duplicates with provided historical questions.
-- Keep answers concise but comprehensive and interview-ready.`;
+- Answers must be concise but comprehensive and interview-ready, using well-structured Markdown (headings, lists, code blocks, bold key terms).`;
 
 const MODULE_SYSTEM_PROMPTS: Record<string, string> = {
   full_simulation: `You are a strict interviewer simulating one complete real interview round.
@@ -88,6 +102,7 @@ Hard requirements:
 - Return exactly 15 questions.
 - difficulty only: Easy | Medium | Hard.
 - Target difficulty distribution: 5 Easy, 6 Medium, 4 Hard.
+- Answers must use well-structured Markdown: ## headings for sections, **bold** key terms, bullet/numbered lists, \`code\` for identifiers, fenced code blocks for examples, > blockquotes for caveats.
 - Avoid semantic duplicates with historical questions.`,
   knowledge: `You are a principle-focused technical interviewer.
 Objectives:
@@ -99,6 +114,7 @@ Hard requirements:
 - difficulty only: Easy | Medium | Hard.
 - Target difficulty distribution: 4 Easy, 6 Medium, 5 Hard.
 - Each answer should include mechanism and boundary conditions.
+- Answers must use well-structured Markdown: ## headings for sections, **bold** key terms, bullet lists, \`code\` for identifiers, fenced code blocks for examples, > blockquotes for caveats.
 - Avoid semantic duplicates with historical questions.`,
   project: `You are a project deep-dive interviewer.
 Objectives:
@@ -110,6 +126,7 @@ Hard requirements:
 - difficulty only: Easy | Medium | Hard.
 - Target difficulty distribution: 3 Easy, 6 Medium, 6 Hard.
 - Answers should include verifiable project signals (metrics, constraints, trade-offs, incident handling, or rollout strategy).
+- Answers must use well-structured Markdown: ## headings for sections, **bold** key terms, bullet lists, \`code\` for identifiers, tables for comparisons, > blockquotes for caveats.
 - Avoid semantic duplicates with historical questions.`,
   scenario: `You are a situational and behavioral interviewer assessing judgment under uncertainty.
 Objectives:
@@ -121,6 +138,7 @@ Hard requirements:
 - difficulty only: Easy | Medium | Hard.
 - Target difficulty distribution: 5 Easy, 5 Medium, 5 Hard.
 - Answers should be structured and actionable (steps, stakeholders, rationale, result, retrospective).
+- Answers must use well-structured Markdown: ## headings for sections, **bold** key terms, numbered lists for steps, bullet lists for enumeration, > blockquotes for key takeaways.
 - Avoid semantic duplicates with historical questions.`,
 };
 
@@ -197,8 +215,9 @@ async function generateWithGoogle(
   const ai = new GoogleGenAI({
     apiKey: apiKey.trim(),
     httpOptions: {
-      timeout: 90_000,
-      retryOptions: { attempts: 5 },
+      // Gemini 2.5 Flash structured output (15 questions) can take 60-90s.
+      // Be generous to avoid premature DEADLINE_EXCEEDED from our side.
+      timeout: 120_000,
     },
   });
   try {
@@ -240,14 +259,20 @@ async function generateWithOpenAICompatible(
   model: string,
   systemPrompt: string,
   userPrompt: string,
-  baseUrl = "https://api.openai.com/v1"
+  baseUrl = "https://api.openai.com/v1",
+  timeoutMs = 55_000
 ): Promise<GenerationResult> {
-  const resp = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey.trim()}`,
-    },
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let resp: Response;
+  try {
+    resp = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey.trim()}`,
+      },
     body: JSON.stringify({
       model,
       messages: [
@@ -258,9 +283,33 @@ async function generateWithOpenAICompatible(
       temperature: 0.7,
     }),
   });
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(data.error?.message || `OpenAI-compatible API error (${resp.status})`);
-  return JSON.parse(data.choices[0].message.content);
+  } finally {
+    clearTimeout(timer);
+  }
+  let data: any;
+  const rawText = await resp.text();
+  try {
+    data = JSON.parse(rawText);
+  } catch {
+    console.error(`OpenAI-compatible API returned non-JSON (status ${resp.status}):`, rawText.slice(0, 500));
+    throw new Error(`Provider returned non-JSON response (HTTP ${resp.status})`);
+  }
+  if (!resp.ok) {
+    const errMsg = data?.error?.message || data?.error || JSON.stringify(data).slice(0, 300);
+    throw new Error(`Provider returned error (HTTP ${resp.status}): ${errMsg}`);
+  }
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    console.error("OpenAI-compatible API returned no content. Full response:", JSON.stringify(data).slice(0, 1000));
+    throw new Error(`模型未返回内容。可能模型不可用或请求被拒绝。请换一个模型重试。`);
+  }
+  // Try to extract JSON from possible markdown fences
+  const jsonMatch = content.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    console.error("Failed to extract JSON from model output:", content.slice(0, 500));
+    throw new Error("模型返回的内容不是有效 JSON。请换一个模型重试。");
+  }
+  return JSON.parse(jsonMatch[0]);
 }
 
 async function generateWithAnthropic(
@@ -269,22 +318,28 @@ async function generateWithAnthropic(
   systemPrompt: string,
   userPrompt: string
 ): Promise<GenerationResult> {
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey.trim(),
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 8192,
-      system: systemPrompt,
-      messages: [
-        { role: "user", content: userPrompt + JSON_INSTRUCTION },
-      ],
-    }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 55_000);
+  let resp: Response;
+  try {
+    resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey.trim(),
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 8192,
+        system: systemPrompt,
+        messages: [{ role: "user", content: userPrompt + JSON_INSTRUCTION }],
+      }),
+    });
+  } finally {
+    clearTimeout(timer);
+  }
   const data = await resp.json();
   if (!resp.ok) throw new Error(data.error?.message || `Anthropic API error (${resp.status})`);
   const text = data.content[0].text;
@@ -309,6 +364,8 @@ async function generateQuestions(
       return generateWithOpenAICompatible(apiKey, model, systemPrompt, userPrompt, "https://api.openai.com/v1");
     case "deepseek":
       return generateWithOpenAICompatible(apiKey, model, systemPrompt, userPrompt, "https://api.deepseek.com");
+    case "openrouter":
+      return generateWithOpenAICompatible(apiKey, model, systemPrompt, userPrompt, "https://openrouter.ai/api/v1", 120_000);
     case "anthropic":
       return generateWithAnthropic(apiKey, model, systemPrompt, userPrompt);
     default:
@@ -335,7 +392,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = 5201;
 
   if (!process.env.GEMINI_API_KEY) {
     console.error("CRITICAL: GEMINI_API_KEY is missing from environment variables.");
@@ -634,7 +691,7 @@ async function startServer() {
                 "anthropic-version": "2023-06-01",
               },
               body: JSON.stringify({
-                model: def.models[0].id,
+                model: def.models[0]?.id || "claude-3-5-haiku-20241022",
                 max_tokens: 10,
                 messages: [{ role: "user", content: testPrompt }],
               }),
@@ -643,6 +700,19 @@ async function startServer() {
               const errData = await resp.json().catch(() => ({}));
               throw new Error((errData as any).error?.message || `HTTP ${resp.status}`);
             }
+            break;
+          }
+          case "openrouter": {
+            // Validate key via OpenRouter's key-info endpoint (free, no charge)
+            const resp = await fetch("https://openrouter.ai/api/v1/auth/key", {
+              headers: { Authorization: `Bearer ${key}` },
+            });
+            if (!resp.ok) {
+              const errData = await resp.json().catch(() => ({}));
+              throw new Error((errData as any).error?.message || `HTTP ${resp.status}`);
+            }
+            const info = await resp.json();
+            if (!info.data) throw new Error("无效的 OpenRouter API Key");
             break;
           }
         }
@@ -663,17 +733,151 @@ async function startServer() {
     res.json({ apiKey: key });
   });
 
-  app.post("/api/generate-questions", upload.single("file"), async (req, res) => {
+  // Fetch available models from a provider (dynamically via the provider's API)
+  app.get("/api/providers/:id/models", async (req, res) => {
+    const { id } = req.params;
+    const key = (req.query.apiKey as string)?.trim() || resolveApiKey(id);
+    if (!key) return res.status(400).json({ error: "No API key configured for this provider" });
+
     try {
-      const { moduleId, githubUrl, textContext, modelId, providerId: explicitProviderId } = req.body;
-      const file = req.file;
+      switch (id) {
+        case "google": {
+          const resp = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models?key=${key}&pageSize=100`
+          );
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
+          const models = (data.models || [])
+            .filter((m: any) =>
+              Array.isArray(m.supportedGenerationMethods) &&
+              m.supportedGenerationMethods.includes("generateContent") &&
+              m.name.includes("gemini")
+            )
+            .map((m: any) => ({
+              id: m.name.replace("models/", ""),
+              name: m.displayName || m.name.replace("models/", ""),
+              desc: m.description?.slice(0, 80) || "",
+            }));
+          res.json({ models });
+          break;
+        }
+        case "openai": {
+          const resp = await fetch("https://api.openai.com/v1/models", {
+            headers: { Authorization: `Bearer ${key}` },
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
+          const chatModels = (data.data || [])
+            .filter((m: any) => /^(gpt-|o1|o3|chatgpt)/i.test(m.id) && !m.id.includes("-instruct"))
+            .sort((a: any, b: any) => (b.created || 0) - (a.created || 0))
+            .slice(0, 30)
+            .map((m: any) => ({ id: m.id, name: m.id, desc: "" }));
+          res.json({ models: chatModels });
+          break;
+        }
+        case "deepseek": {
+          res.json({
+            models: [
+              { id: "deepseek-chat", name: "DeepSeek-V3", desc: "通用对话模型，性价比极高" },
+              { id: "deepseek-reasoner", name: "DeepSeek-R1", desc: "深度推理模型" },
+            ],
+          });
+          break;
+        }
+        case "anthropic": {
+          res.json({
+            models: [
+              { id: "claude-opus-4-20250514", name: "Claude Opus 4", desc: "最强推理，旗舰模型" },
+              { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4", desc: "最强综合能力" },
+              { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet", desc: "稳定高效" },
+              { id: "claude-3-5-haiku-20241022", name: "Claude 3.5 Haiku", desc: "快速轻量" },
+            ],
+          });
+          break;
+        }
+        case "openrouter": {
+          const resp = await fetch("https://openrouter.ai/api/v1/models", {
+            headers: { Authorization: `Bearer ${key}` },
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
+          const models = (data.data || [])
+            .map((m: any) => ({
+              id: m.id,
+              name: m.name || m.id,
+              desc: m.context_length
+                ? `${Math.round(m.context_length / 1000)}k ctx`
+                : "",
+            }))
+            .sort((a: any, b: any) => a.id.localeCompare(b.id));
+          res.json({ models });
+          break;
+        }
+        default:
+          res.status(400).json({ error: `Unknown provider: ${id}` });
+      }
+    } catch (err: any) {
+      console.error(`Error fetching models for ${id}:`, err);
+      res.status(500).json({ error: err.message || "Failed to fetch models" });
+    }
+  });
 
-      const modelToUse = modelId || "gemini-2.5-flash";
+  // Get the currently active model selection
+  app.get("/api/settings/active-model", (req, res) => {
+    try {
+      const row = db.prepare("SELECT value FROM user_settings WHERE key = 'active_model'").get() as { value: string } | undefined;
+      if (!row) {
+        // Auto-pick the first model of the first configured provider
+        const firstProvider = db.prepare("SELECT id FROM api_providers WHERE is_active = 1 LIMIT 1").get() as { id: string } | undefined;
+        const providerId = firstProvider?.id || (process.env.GEMINI_API_KEY ? "google" : null);
+        if (!providerId) return res.json({ modelId: null, providerId: null, modelName: null });
+        const def = PROVIDER_MAP[providerId];
+        const defaultModel = def?.models?.[0];
+        if (!defaultModel && providerId !== "openrouter") return res.json({ modelId: null, providerId: null, modelName: null });
+        if (providerId === "google") {
+          return res.json({ modelId: "gemini-2.5-flash", providerId: "google", modelName: "Gemini 2.5 Flash" });
+        }
+        if (defaultModel) {
+          return res.json({ modelId: defaultModel.id, providerId, modelName: defaultModel.name });
+        }
+        return res.json({ modelId: null, providerId: null, modelName: null });
+      }
+      res.json(JSON.parse(row.value));
+    } catch (error) {
+      console.error("Error fetching active model:", error);
+      res.status(500).json({ error: "Failed to fetch active model" });
+    }
+  });
 
-      // Resolve which provider this model belongs to
-      const providerDef = explicitProviderId
-        ? PROVIDER_MAP[explicitProviderId]
-        : findProviderForModel(modelToUse);
+  // Set the active model
+  app.put("/api/settings/active-model", (req, res) => {
+    try {
+      const { modelId, providerId, modelName } = req.body;
+      if (!modelId || !providerId) {
+        return res.status(400).json({ error: "modelId and providerId are required" });
+      }
+      db.prepare(`
+        INSERT INTO user_settings (key, value, updated_at) VALUES ('active_model', ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+      `).run(JSON.stringify({ modelId, providerId, modelName: modelName || modelId }));
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error saving active model:", error);
+      res.status(500).json({ error: "Failed to save active model" });
+    }
+  });
+
+  app.post("/api/generate-questions", upload.single("file"), async (req, res) => {
+    const { moduleId, githubUrl, textContext, modelId, providerId: explicitProviderId } = req.body;
+    const file = req.file;
+    const modelToUse = modelId || "gemini-2.5-flash";
+
+    // Resolve which provider this model belongs to (hoisted so catch block can access it)
+    const providerDef = explicitProviderId
+      ? PROVIDER_MAP[explicitProviderId]
+      : findProviderForModel(modelToUse);
+
+    try {
       
       if (!providerDef) {
         return res.status(400).json({ error: `Cannot find provider for model: ${modelToUse}` });
@@ -740,19 +944,31 @@ async function startServer() {
         responseData = await generateQuestions(providerId, apiKey, modelToUse, systemPrompt, userPrompt);
       } catch (error: any) {
         // Gemini 2.5 Flash occasionally hits transient network/gateway issues.
-        // Auto-fallback to Flash Lite to keep the flow stable.
+        // Retry once with the same model before falling back to Flash Lite.
         if (
           providerId === "google" &&
           modelToUse === "gemini-2.5-flash" &&
           isTransientGoogleConnectionError(error)
         ) {
-          const fallbackModel = "gemini-2.5-flash-lite";
           console.warn(
-            `Primary model failed, falling back: ${modelToUse} -> ${fallbackModel}. Reason: ${getErrorDetail(error)}`
+            `Primary model failed (attempt 1), retrying same model: ${modelToUse}. Reason: ${getErrorDetail(error)}`
           );
-          responseData = await generateQuestions(providerId, apiKey, fallbackModel, systemPrompt, userPrompt);
-          fallbackFromModel = modelToUse;
-          actualModelUsed = fallbackModel;
+          try {
+            responseData = await generateQuestions(providerId, apiKey, modelToUse, systemPrompt, userPrompt);
+          } catch (retryError: any) {
+            // Retry also failed — now fall back to Flash Lite
+            if (isTransientGoogleConnectionError(retryError)) {
+              const fallbackModel = "gemini-2.5-flash-lite";
+              console.warn(
+                `Retry also failed, falling back: ${modelToUse} -> ${fallbackModel}. Reason: ${getErrorDetail(retryError)}`
+              );
+              responseData = await generateQuestions(providerId, apiKey, fallbackModel, systemPrompt, userPrompt);
+              fallbackFromModel = modelToUse;
+              actualModelUsed = fallbackModel;
+            } else {
+              throw retryError;
+            }
+          }
         } else {
           throw error;
         }
@@ -781,7 +997,8 @@ async function startServer() {
       if (error?.stack) {
         console.error(error.stack);
       }
-      res.status(500).json({ error: toClientSafeErrorMessage(error) });
+      const pName = providerDef?.name || "AI";
+      res.status(500).json({ error: toClientSafeErrorMessage(error, pName) });
     }
   });
 
@@ -805,7 +1022,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
 }
 

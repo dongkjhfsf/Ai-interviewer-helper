@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
 import { Download, Play, ChevronDown } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 export default function QuestionList({ data, onStart }: { data: any, onStart: () => void }) {
   const questions = data?.questions || [];
@@ -119,8 +121,12 @@ function QuestionCard({ question, index }: QuestionCardProps) {
               animate={{ height: 'auto', opacity: 1 }}
               className="mt-6 pt-6 border-t border-zinc-100"
             >
-              <div className="bg-[#fcfbf9] p-6 rounded-2xl text-zinc-600 text-sm leading-relaxed whitespace-pre-wrap border border-orange-50">
-                {question.answer}
+              <div className="prose prose-sm prose-zinc max-w-none bg-[#fcfbf9] p-6 rounded-2xl border border-orange-50 [&_pre]:bg-zinc-50 [&_pre]:rounded-xl [&_pre]:p-4 [&_pre]:overflow-x-auto [&_code]:text-orange-600 [&_code]:text-xs [&_pre_code]:text-zinc-700 [&_pre_code]:text-xs [&_h1]:text-lg [&_h2]:text-base [&_h3]:text-sm [&_ul]:my-2 [&_ol]:my-2 [&_li]:my-0.5 [&_p]:my-2 [&_table]:text-xs [&_th]:px-3 [&_th]:py-1.5 [&_td]:px-3 [&_td]:py-1.5 [&_blockquote]:border-orange-300 [&_blockquote]:text-zinc-500 [&_a]:text-orange-600">
+                {question.answer ? (
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{question.answer}</ReactMarkdown>
+                ) : (
+                  <p className="text-zinc-400 italic">暂无答案解析。</p>
+                )}
               </div>
             </motion.div>
           )}

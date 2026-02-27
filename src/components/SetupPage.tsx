@@ -1,18 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { UploadCloud, Github, Briefcase, BookOpen, Layers, Target, ArrowRight, Loader2, Settings, Cpu, X, Check, RotateCcw, Database, KeyRound } from 'lucide-react';
-import { PROVIDER_DEFS, getProviderColorClasses, findProviderForModel } from '../providers';
+import { UploadCloud, Github, Briefcase, BookOpen, Layers, Target, ArrowRight, Loader2, X, RotateCcw, Database, KeyRound, Cpu } from 'lucide-react';
 import ApiSettings from './ApiSettings';
-
-interface AvailableModel {
-  id: string;
-  name: string;
-  badge: string;
-  desc: string;
-  providerId: string;
-  providerName: string;
-  color: string;
-}
 
 const MODULES = [
   { id: 'full_simulation', name: 'Full Simulation', icon: Briefcase, desc: 'End-to-end interview experience' },
@@ -41,63 +30,45 @@ export default function SetupPage({
   const [selectedModule, setSelectedModule] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [selectedModel, setSelectedModel] = useState('gemini-2.5-flash');
-  const [selectedProviderId, setSelectedProviderId] = useState('google');
-  const [showModelPicker, setShowModelPicker] = useState(false);
   const [showReusePicker, setShowReusePicker] = useState(false);
   const [showApiSettings, setShowApiSettings] = useState(false);
   const [reuseBatches, setReuseBatches] = useState<any[]>([]);
   const [isReuseLoading, setIsReuseLoading] = useState(false);
   const [reuseError, setReuseError] = useState<string | null>(null);
-  const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [configuredProviders, setConfiguredProviders] = useState<Set<string>>(new Set());
+  const [activeModel, setActiveModel] = useState<{ modelId: string; providerId: string; modelName: string } | null>(null);
   const { githubUrl, textContext, file } = persistedInputs;
 
-  // Fetch available models from configured providers
+  // Fetch configured providers indicator
   const fetchProviderStatus = async () => {
     try {
       const res = await fetch('/api/providers', { credentials: 'omit' });
       const data = await res.json();
-      const providers = data.providers || [];
-      
       const configured = new Set<string>();
-      const models: AvailableModel[] = [];
-
-      for (const p of providers) {
-        if (p.configured) {
-          configured.add(p.id);
-          for (const m of p.models) {
-            models.push({
-              id: m.id,
-              name: m.name,
-              badge: m.badge,
-              desc: m.desc,
-              providerId: p.id,
-              providerName: p.name,
-              color: p.color,
-            });
-          }
-        }
+      for (const p of (data.providers || [])) {
+        if (p.configured) configured.add(p.id);
       }
-
       setConfiguredProviders(configured);
-      setAvailableModels(models);
-
-      // If currently selected model is not available, auto-select the first available one
-      if (models.length > 0 && !models.find(m => m.id === selectedModel)) {
-        setSelectedModel(models[0].id);
-        setSelectedProviderId(models[0].providerId);
-      }
     } catch (e) {
       console.error('Failed to fetch provider status:', e);
     }
   };
 
+  // Fetch the currently active model selection
+  const fetchActiveModel = async () => {
+    try {
+      const res = await fetch('/api/settings/active-model', { credentials: 'omit' });
+      const data = await res.json();
+      if (data.modelId) setActiveModel(data);
+    } catch (e) {
+      console.error('Failed to fetch active model:', e);
+    }
+  };
+
   useEffect(() => {
     fetchProviderStatus();
+    fetchActiveModel();
   }, []);
-
-  const currentModel = availableModels.find(m => m.id === selectedModel) || availableModels[0];
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -119,8 +90,10 @@ export default function SetupPage({
     try {
       const formData = new FormData();
       formData.append('moduleId', selectedModule);
-      formData.append('modelId', selectedModel);
-      formData.append('providerId', selectedProviderId);
+      if (activeModel) {
+        formData.append('modelId', activeModel.modelId);
+        formData.append('providerId', activeModel.providerId);
+      }
       if (githubUrl) formData.append('githubUrl', githubUrl);
       if (textContext) formData.append('textContext', textContext);
       if (file) formData.append('file', file);
@@ -197,26 +170,22 @@ export default function SetupPage({
 
   return (
     <div className="min-h-screen bg-[#faf9f6] text-zinc-900 overflow-hidden flex flex-col md:flex-row">
-      {/* Top Right Buttons */}
+      {/* Top Right: API Settings Button */}
       <div className="fixed top-5 right-5 z-40 flex items-center gap-2">
-        {/* API Settings Button */}
         <button
           onClick={() => setShowApiSettings(true)}
           className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white border border-zinc-200 shadow-sm hover:shadow-md hover:border-zinc-300 transition-all text-sm text-zinc-600"
         >
           <KeyRound className="w-4 h-4 text-orange-500" />
           <span className="font-medium">API 设置</span>
-          <span className={`w-2 h-2 rounded-full ${configuredProviders.size > 0 ? 'bg-green-400' : 'bg-red-400'}`} />
-        </button>
-
-        {/* Model Switcher Button */}
-        <button
-          onClick={() => setShowModelPicker(true)}
-          className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white border border-zinc-200 shadow-sm hover:shadow-md hover:border-zinc-300 transition-all text-sm text-zinc-600"
-        >
-          <Cpu className="w-4 h-4 text-orange-500" />
-          <span className="font-medium">{currentModel?.name || '选择模型'}</span>
-          <Settings className="w-3.5 h-3.5 text-zinc-400" />
+          {activeModel ? (
+            <span className="flex items-center gap-1 text-xs text-orange-600 font-medium">
+              <Cpu className="w-3 h-3" />
+              <span className="hidden sm:inline max-w-[100px] truncate">{activeModel.modelName}</span>
+            </span>
+          ) : (
+            <span className={`w-2 h-2 rounded-full ${configuredProviders.size > 0 ? 'bg-green-400' : 'bg-red-400'}`} />
+          )}
         </button>
       </div>
 
@@ -225,102 +194,10 @@ export default function SetupPage({
         open={showApiSettings}
         onClose={() => {
           setShowApiSettings(false);
-          fetchProviderStatus(); // Refresh available models when closing settings
+          fetchProviderStatus();
+          fetchActiveModel();
         }}
       />
-
-      {/* Model Picker Modal */}
-      <AnimatePresence>
-        {showModelPicker && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-zinc-900/40 backdrop-blur-sm">
-            <motion.div
-              initial={{ scale: 0.95, opacity: 0, y: 20 }}
-              animate={{ scale: 1, opacity: 1, y: 0 }}
-              exit={{ scale: 0.95, opacity: 0, y: 20 }}
-              className="bg-white rounded-3xl shadow-2xl w-full max-w-md border border-zinc-100 overflow-hidden max-h-[80vh] flex flex-col"
-            >
-              <div className="p-8 pb-6">
-                <div className="flex items-center justify-between mb-6">
-                  <div>
-                    <h3 className="text-xl font-bold text-zinc-900">选择生成模型</h3>
-                    <p className="text-zinc-400 text-sm mt-1">选择用于题单生成的 AI 模型</p>
-                  </div>
-                  <button
-                    onClick={() => setShowModelPicker(false)}
-                    className="p-2 rounded-xl hover:bg-zinc-100 text-zinc-400 hover:text-zinc-700 transition-colors"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
-                </div>
-
-                <div className="space-y-3 max-h-[50vh] overflow-y-auto pr-1">
-                  {availableModels.length === 0 ? (
-                    <div className="text-center py-8 border border-dashed border-zinc-200 rounded-2xl">
-                      <KeyRound className="w-8 h-8 text-zinc-300 mx-auto mb-3" />
-                      <p className="text-sm text-zinc-500 mb-2">尚未配置任何 API 密钥</p>
-                      <button
-                        onClick={() => { setShowModelPicker(false); setShowApiSettings(true); }}
-                        className="text-sm text-orange-600 hover:text-orange-700 font-medium"
-                      >
-                        前往 API 设置 →
-                      </button>
-                    </div>
-                  ) : (
-                    // Group models by provider
-                    PROVIDER_DEFS.filter(p => configuredProviders.has(p.id)).map(provider => {
-                      const providerModels = availableModels.filter(m => m.providerId === provider.id);
-                      if (providerModels.length === 0) return null;
-                      const colors = getProviderColorClasses(provider.color);
-                      return (
-                        <div key={provider.id} className="space-y-2">
-                          <div className="flex items-center gap-2 pt-2 first:pt-0">
-                            <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-md ${colors.badge}`}>
-                              {provider.name}
-                            </span>
-                          </div>
-                          {providerModels.map(model => {
-                            const isSelected = selectedModel === model.id;
-                            const badgeColor = colors.badge;
-                            return (
-                              <button
-                                key={model.id}
-                                onClick={() => {
-                                  setSelectedModel(model.id);
-                                  setSelectedProviderId(model.providerId);
-                                  setShowModelPicker(false);
-                                }}
-                                className={`w-full text-left p-4 rounded-2xl border-2 transition-all flex items-center gap-4 ${isSelected
-                                  ? `${colors.border} ${colors.bg}`
-                                  : 'border-zinc-100 bg-white hover:border-zinc-300'
-                                }`}
-                              >
-                                <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-xs font-bold ${badgeColor}`}>
-                                  {model.badge}
-                                </div>
-                                <div className="flex-1">
-                                  <div className="font-semibold text-zinc-800 text-sm">{model.name}</div>
-                                  <div className="text-zinc-400 text-xs mt-0.5">{model.desc}</div>
-                                </div>
-                                {isSelected && <Check className="w-5 h-5 text-orange-500 flex-shrink-0" />}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-
-              <div className="px-8 pb-8">
-                <p className="text-xs text-zinc-400 leading-relaxed border-t border-zinc-50 pt-4">
-                  实时语音面试仅支持 Google Gemini Live API，题单生成支持所有已配置的服务商。
-                </p>
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
 
       {/* Reuse Existing Batch Modal */}
       <AnimatePresence>
@@ -546,6 +423,22 @@ export default function SetupPage({
                 </>
               )}
             </motion.button>
+
+            {/* Active model indicator */}
+            {activeModel ? (
+              <div className="flex items-center justify-center gap-1.5 text-xs text-zinc-500">
+                <Cpu className="w-3.5 h-3.5 text-orange-400" />
+                <span>模型：<span className="font-medium text-zinc-700">{activeModel.modelName}</span></span>
+                <button onClick={() => setShowApiSettings(true)} className="text-orange-500 hover:text-orange-600 ml-1">更改</button>
+              </div>
+            ) : (
+              <div className="flex items-center justify-center gap-1.5 text-xs text-orange-500">
+                <KeyRound className="w-3.5 h-3.5" />
+                <button onClick={() => setShowApiSettings(true)} className="hover:text-orange-600">
+                  请先配置 API 并选择模型 →
+                </button>
+              </div>
+            )}
 
             <motion.button
               whileHover={{ scale: 1.02 }}

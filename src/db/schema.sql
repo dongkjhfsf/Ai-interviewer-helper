@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS api_providers (
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS user_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 INSERT OR IGNORE INTO modules (id, name, description) VALUES 
 ('full_simulation', 'Full Simulation', 'Simulates a real interview environment'),
 ('knowledge', 'Knowledge Module', 'Focuses on technical knowledge and concepts'),

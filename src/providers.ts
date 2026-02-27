@@ -75,6 +75,16 @@ export const PROVIDER_DEFS: ProviderDef[] = [
       { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', desc: '快速高效', badge: 'H' },
     ],
   },
+  {
+    id: 'openrouter',
+    name: 'OpenRouter',
+    description: '支持题单生成，聚合 200+ 模型（GPT/Claude/Gemini/Llama 等）',
+    color: 'violet',
+    capabilities: ['text'] as const,
+    placeholder: 'sk-or-v1-...',
+    helpUrl: 'https://openrouter.ai/settings/keys',
+    models: [], // fetched dynamically
+  },
 ];
 
 // Map from provider.id -> provider
@@ -93,6 +103,7 @@ export function getProviderColorClasses(color: string) {
     purple: { badge: 'bg-purple-100 text-purple-600',  border: 'border-purple-500', bg: 'bg-purple-50', text: 'text-purple-600' },
     amber:  { badge: 'bg-amber-100 text-amber-600',    border: 'border-amber-500', bg: 'bg-amber-50',  text: 'text-amber-600' },
     orange: { badge: 'bg-orange-100 text-orange-600',   border: 'border-orange-500', bg: 'bg-orange-50', text: 'text-orange-600' },
+    violet: { badge: 'bg-violet-100 text-violet-600',  border: 'border-violet-500', bg: 'bg-violet-50', text: 'text-violet-600' },
   };
   return map[color] || map.blue;
 }

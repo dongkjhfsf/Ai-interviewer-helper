@@ -1,6 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { X, Check, Loader2, Eye, EyeOff, ExternalLink, Trash2, FlaskConical, ShieldCheck, ShieldX, KeyRound } from 'lucide-react';
+import {
+  X, Check, Loader2, Eye, EyeOff, ExternalLink, Trash2, FlaskConical,
+  ShieldCheck, ShieldX, KeyRound, ChevronDown, ChevronUp, RefreshCw, Cpu,
+} from 'lucide-react';
 import { PROVIDER_DEFS, getProviderColorClasses } from '../providers';
 
 // Provider icon components
@@ -31,8 +34,12 @@ function ProviderIcon({ providerId, className }: { providerId: string; className
         <path d="M13.827 3.52h3.603L24 20.48h-3.603L13.827 3.52zm-7.258 0h3.767L16.906 20.48h-3.674l-1.343-3.461H5.017l-1.344 3.46H0L6.57 3.522zm1.04 4.27L5.29 13.898h4.638L7.61 7.789z" />
       </svg>
     ),
+    openrouter: (
+      <svg viewBox="0 0 24 24" className={className} fill="currentColor">
+        <path d="M21 3L3 10.53v.98l6.84 2.65L12.48 21h.98L21 3z" />
+      </svg>
+    ),
   };
-
   return <>{icons[providerId] || <KeyRound className={className} />}</>;
 }
 
@@ -52,6 +59,18 @@ interface ProviderStatus {
   baseUrl: string | null;
 }
 
+interface FetchedModel {
+  id: string;
+  name: string;
+  desc: string;
+}
+
+interface ActiveModel {
+  modelId: string;
+  providerId: string;
+  modelName: string;
+}
+
 export default function ApiSettings({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
   const [loading, setLoading] = useState(true);
@@ -62,6 +81,14 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ id: string; success: boolean; message: string } | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Dynamic model state
+  const [providerModels, setProviderModels] = useState<Record<string, FetchedModel[]>>({});
+  const [fetchingModelsFor, setFetchingModelsFor] = useState<string | null>(null);
+  const [expandedModelProvider, setExpandedModelProvider] = useState<string | null>(null);
+  const [activeModel, setActiveModel] = useState<ActiveModel | null>(null);
+  const [settingActiveModel, setSettingActiveModel] = useState(false);
+  const [modelSearchQuery, setModelSearchQuery] = useState('');
 
   const fetchProviders = async () => {
     try {
@@ -76,11 +103,58 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
     }
   };
 
+  const fetchActiveModel = async () => {
+    try {
+      const res = await fetch('/api/settings/active-model', { credentials: 'omit' });
+      const data = await res.json();
+      if (data.modelId) setActiveModel(data);
+    } catch (e) {
+      console.error('Failed to fetch active model:', e);
+    }
+  };
+
+  const fetchModels = async (providerId: string, apiKey?: string) => {
+    setFetchingModelsFor(providerId);
+    try {
+      const url = apiKey
+        ? `/api/providers/${providerId}/models?apiKey=${encodeURIComponent(apiKey)}`
+        : `/api/providers/${providerId}/models`;
+      const res = await fetch(url, { credentials: 'omit' });
+      if (!res.ok) throw new Error('Failed');
+      const data = await res.json();
+      setProviderModels(prev => ({ ...prev, [providerId]: data.models || [] }));
+    } catch (e) {
+      console.error(`Failed to fetch models for ${providerId}:`, e);
+    } finally {
+      setFetchingModelsFor(null);
+    }
+  };
+
+  const handleSetActiveModel = async (providerId: string, modelId: string, modelName: string) => {
+    setSettingActiveModel(true);
+    try {
+      await fetch('/api/settings/active-model', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'omit',
+        body: JSON.stringify({ modelId, providerId, modelName }),
+      });
+      setActiveModel({ modelId, providerId, modelName });
+    } catch (e) {
+      console.error('Failed to set active model:', e);
+    } finally {
+      setSettingActiveModel(false);
+    }
+  };
+
   useEffect(() => {
     if (open) {
       fetchProviders();
+      fetchActiveModel();
       setEditingId(null);
       setTestResult(null);
+      setExpandedModelProvider(null);
+      setModelSearchQuery('');
     }
   }, [open]);
 
@@ -122,6 +196,27 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
       });
       const data = await res.json();
       setTestResult({ id: providerId, success: data.success, message: data.message || data.error });
+      if (data.success) {
+        // If we have an unsaved key, save it first so model fetch can resolve the key from DB
+        if (keyToTest) {
+          try {
+            await fetch('/api/providers', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              credentials: 'omit',
+              body: JSON.stringify({ id: providerId, apiKey: keyToTest }),
+            });
+            // Refresh providers list to reflect saved state
+            fetchProviders();
+          } catch (e) {
+            console.error('Auto-save key failed:', e);
+          }
+        }
+        // Auto-fetch models and expand the model panel
+        fetchModels(providerId, keyToTest);
+        setExpandedModelProvider(providerId);
+        setModelSearchQuery('');
+      }
     } catch (e: any) {
       setTestResult({ id: providerId, success: false, message: e.message });
     } finally {
@@ -132,11 +227,10 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
   const handleDelete = async (providerId: string) => {
     setDeletingId(providerId);
     try {
-      await fetch(`/api/providers/${providerId}`, {
-        method: 'DELETE',
-        credentials: 'omit',
-      });
+      await fetch(`/api/providers/${providerId}`, { method: 'DELETE', credentials: 'omit' });
       await fetchProviders();
+      setProviderModels(prev => { const n = { ...prev }; delete n[providerId]; return n; });
+      if (expandedModelProvider === providerId) setExpandedModelProvider(null);
     } catch (e) {
       console.error('Failed to delete provider:', e);
     } finally {
@@ -149,6 +243,21 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
     setEditKey('');
     setShowKey(false);
     setTestResult(null);
+    if (provider.configured && !providerModels[provider.id]) {
+      fetchModels(provider.id);
+    }
+  };
+
+  const toggleModelPanel = (providerId: string) => {
+    if (expandedModelProvider === providerId) {
+      setExpandedModelProvider(null);
+    } else {
+      setExpandedModelProvider(providerId);
+      setModelSearchQuery('');
+      if (!providerModels[providerId]) {
+        fetchModels(providerId);
+      }
+    }
   };
 
   if (!open) return null;
@@ -162,7 +271,7 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
           initial={{ scale: 0.95, opacity: 0, y: 20 }}
           animate={{ scale: 1, opacity: 1, y: 0 }}
           exit={{ scale: 0.95, opacity: 0, y: 20 }}
-          className="bg-white rounded-3xl shadow-2xl w-full max-w-2xl border border-zinc-100 overflow-hidden max-h-[90vh] flex flex-col"
+          className="bg-white rounded-3xl shadow-2xl w-full max-w-2xl border border-zinc-100 overflow-hidden max-h-[92vh] flex flex-col"
         >
           {/* Header */}
           <div className="p-6 md:p-8 pb-4 border-b border-zinc-100">
@@ -170,18 +279,25 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
               <div>
                 <h3 className="text-xl font-bold text-zinc-900 flex items-center gap-2">
                   <KeyRound className="w-5 h-5 text-orange-500" />
-                  API 密钥管理
+                  API 密钥 &amp; 模型管理
                 </h3>
                 <p className="text-zinc-400 text-sm mt-1">
                   已配置 {configuredCount}/{providers.length} 个服务商 · 实时语音仅支持 Google Gemini
                 </p>
               </div>
-              <button
-                onClick={onClose}
-                className="p-2 rounded-xl hover:bg-zinc-100 text-zinc-400 hover:text-zinc-700 transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-3">
+                {activeModel && (
+                  <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-orange-50 border border-orange-200">
+                    <Cpu className="w-3.5 h-3.5 text-orange-500" />
+                    <span className="text-xs font-medium text-orange-700 max-w-[160px] truncate">
+                      {activeModel.modelName}
+                    </span>
+                  </div>
+                )}
+                <button onClick={onClose} className="p-2 rounded-xl hover:bg-zinc-100 text-zinc-400 hover:text-zinc-700 transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
           </div>
 
@@ -189,8 +305,7 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
           <div className="flex-1 overflow-y-auto p-6 md:p-8 pt-4 space-y-4">
             {loading ? (
               <div className="py-12 text-center text-zinc-400 text-sm flex items-center justify-center gap-2">
-                <Loader2 className="w-4 h-4 animate-spin" />
-                加载中...
+                <Loader2 className="w-4 h-4 animate-spin" />加载中...
               </div>
             ) : (
               providers.map((provider) => {
@@ -199,36 +314,44 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
                 const isTesting = testingId === provider.id;
                 const isDeleting = deletingId === provider.id;
                 const hasTestResult = testResult?.id === provider.id;
+                const isModelPanelOpen = expandedModelProvider === provider.id;
+                const isFetchingModels = fetchingModelsFor === provider.id;
+                const models = providerModels[provider.id] || [];
+                const filteredModels = modelSearchQuery
+                  ? models.filter(m =>
+                      m.id.toLowerCase().includes(modelSearchQuery.toLowerCase()) ||
+                      m.name.toLowerCase().includes(modelSearchQuery.toLowerCase())
+                    )
+                  : models;
 
                 return (
                   <motion.div
                     key={provider.id}
                     layout
                     className={`rounded-2xl border-2 transition-all duration-300 overflow-hidden ${
-                      provider.configured
-                        ? `${colors.border} ${colors.bg}`
-                        : 'border-zinc-100 bg-white'
+                      provider.configured ? `${colors.border} ${colors.bg}` : 'border-zinc-100 bg-white'
                     }`}
                   >
                     {/* Provider Header */}
                     <div className="p-4 flex items-center gap-4">
-                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${
+                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${
                         provider.configured ? colors.badge : 'bg-zinc-100 text-zinc-400'
                       }`}>
                         <ProviderIcon providerId={provider.id} className="w-5 h-5" />
                       </div>
 
                       <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-semibold text-zinc-800 text-sm">{provider.name}</span>
                           {provider.capabilities.includes('voice') && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-blue-100 text-blue-600 font-medium">
-                              语音
+                            <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-blue-100 text-blue-600 font-medium">语音</span>
+                          )}
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-zinc-100 text-zinc-500 font-medium">题单</span>
+                          {activeModel?.providerId === provider.id && (
+                            <span className="text-[10px] px-2 py-0.5 rounded-md bg-orange-100 text-orange-600 font-medium flex items-center gap-1">
+                              <Check className="w-2.5 h-2.5" />{activeModel.modelName}
                             </span>
                           )}
-                          <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-zinc-100 text-zinc-500 font-medium">
-                            题单
-                          </span>
                         </div>
                         <div className="text-zinc-400 text-xs mt-0.5">{provider.description}</div>
                         {provider.configured && provider.maskedKey && !isEditing && (
@@ -241,9 +364,18 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
                         )}
                       </div>
 
-                      <div className="flex items-center gap-2 flex-shrink-0">
+                      <div className="flex items-center gap-1.5 flex-shrink-0">
                         {provider.configured && !isEditing && (
                           <>
+                            <button
+                              onClick={() => toggleModelPanel(provider.id)}
+                              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-all ${
+                                isModelPanelOpen ? `${colors.border} ${colors.text} ${colors.bg}` : 'border-zinc-200 text-zinc-500 hover:border-zinc-400'
+                              }`}
+                            >
+                              <Cpu className="w-3.5 h-3.5" />模型
+                              {isModelPanelOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                            </button>
                             <button
                               onClick={() => handleTest(provider.id)}
                               disabled={isTesting}
@@ -265,17 +397,11 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
                           </>
                         )}
                         {provider.configured && !isEditing ? (
-                          <button
-                            onClick={() => startEditing(provider)}
-                            className={`px-3 py-1.5 rounded-xl text-xs font-medium border transition-all ${colors.border} ${colors.text} hover:opacity-80`}
-                          >
+                          <button onClick={() => startEditing(provider)} className={`px-3 py-1.5 rounded-xl text-xs font-medium border transition-all ${colors.border} ${colors.text} hover:opacity-80`}>
                             修改
                           </button>
                         ) : !isEditing ? (
-                          <button
-                            onClick={() => startEditing(provider)}
-                            className="px-3 py-1.5 rounded-xl text-xs font-medium border border-orange-300 text-orange-600 hover:bg-orange-50 transition-all"
-                          >
+                          <button onClick={() => startEditing(provider)} className="px-3 py-1.5 rounded-xl text-xs font-medium border border-orange-300 text-orange-600 hover:bg-orange-50 transition-all">
                             配置
                           </button>
                         ) : null}
@@ -285,24 +411,91 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
                     {/* Test Result */}
                     {hasTestResult && !isEditing && (
                       <div className={`mx-4 mb-3 px-3 py-2 rounded-xl text-xs flex items-center gap-2 ${
-                        testResult.success
-                          ? 'bg-green-50 text-green-700 border border-green-200'
-                          : 'bg-red-50 text-red-700 border border-red-200'
+                        testResult.success ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-red-50 text-red-700 border border-red-200'
                       }`}>
                         {testResult.success ? <ShieldCheck className="w-3.5 h-3.5" /> : <ShieldX className="w-3.5 h-3.5" />}
                         {testResult.message}
                       </div>
                     )}
 
+                    {/* Model Selection Panel */}
+                    <AnimatePresence>
+                      {isModelPanelOpen && !isEditing && (
+                        <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
+                          <div className="px-4 pb-4 border-t border-zinc-100/60 pt-3">
+                            <div className="flex items-center justify-between mb-3">
+                              <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">
+                                可用模型{models.length > 0 ? ` (${models.length})` : ''}
+                              </span>
+                              <button
+                                onClick={() => fetchModels(provider.id)}
+                                disabled={isFetchingModels}
+                                className="flex items-center gap-1 text-[10px] text-orange-500 hover:text-orange-600 disabled:opacity-50"
+                              >
+                                {isFetchingModels ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                                {isFetchingModels ? '获取中...' : '刷新'}
+                              </button>
+                            </div>
+
+                            {isFetchingModels && models.length === 0 ? (
+                              <div className="py-6 text-center text-zinc-400 text-xs flex items-center justify-center gap-2">
+                                <Loader2 className="w-4 h-4 animate-spin" />正在从服务商获取模型列表...
+                              </div>
+                            ) : models.length === 0 ? (
+                              <div className="py-4 text-center text-zinc-400 text-xs">
+                                点击「刷新」从服务商获取可用模型
+                              </div>
+                            ) : (
+                              <>
+                                {models.length > 8 && (
+                                  <input
+                                    type="text"
+                                    value={modelSearchQuery}
+                                    onChange={e => setModelSearchQuery(e.target.value)}
+                                    placeholder="搜索模型..."
+                                    className="w-full mb-2 px-3 py-2 rounded-xl border border-zinc-200 bg-white text-xs focus:outline-none focus:ring-2 focus:ring-orange-500/20 focus:border-orange-300"
+                                  />
+                                )}
+                                <div className="space-y-1 max-h-52 overflow-y-auto pr-1">
+                                  {filteredModels.length === 0 ? (
+                                    <p className="text-xs text-zinc-400 text-center py-3">无匹配模型</p>
+                                  ) : filteredModels.map(m => {
+                                    const isActive = activeModel?.modelId === m.id && activeModel?.providerId === provider.id;
+                                    return (
+                                      <button
+                                        key={m.id}
+                                        onClick={() => handleSetActiveModel(provider.id, m.id, m.name)}
+                                        disabled={settingActiveModel}
+                                        className={`w-full text-left px-3 py-2.5 rounded-xl text-xs flex items-center gap-2.5 transition-all group ${
+                                          isActive ? 'bg-orange-50 border border-orange-200 text-orange-700' : 'hover:bg-zinc-50 border border-transparent hover:border-zinc-200 text-zinc-700'
+                                        }`}
+                                      >
+                                        <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center flex-shrink-0 transition-all ${
+                                          isActive ? 'border-orange-500 bg-orange-500' : 'border-zinc-300 group-hover:border-zinc-400'
+                                        }`}>
+                                          {isActive && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
+                                        </div>
+                                        <span className="font-medium flex-1 truncate">{m.name}</span>
+                                        {m.desc && <span className="text-zinc-400 text-[10px] flex-shrink-0 hidden sm:block max-w-[110px] truncate">{m.desc}</span>}
+                                        {isActive && (
+                                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-600 font-semibold flex-shrink-0">当前</span>
+                                        )}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                                <p className="text-[10px] text-zinc-400 mt-2">点击选择后将用于题单生成</p>
+                              </>
+                            )}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+
                     {/* Edit Form */}
                     <AnimatePresence>
                       {isEditing && (
-                        <motion.div
-                          initial={{ height: 0, opacity: 0 }}
-                          animate={{ height: 'auto', opacity: 1 }}
-                          exit={{ height: 0, opacity: 0 }}
-                          className="overflow-hidden"
-                        >
+                        <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
                           <div className="px-4 pb-4 space-y-3 border-t border-zinc-100/60 pt-3">
                             <div className="relative">
                               <input
@@ -310,37 +503,31 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
                                 value={editKey}
                                 onChange={(e) => setEditKey(e.target.value)}
                                 placeholder={provider.placeholder}
-                                className="w-full px-4 py-3 pr-20 rounded-xl border border-zinc-200 bg-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-orange-500/20 focus:border-orange-300 transition-all"
+                                className="w-full px-4 py-3 pr-12 rounded-xl border border-zinc-200 bg-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-orange-500/20 focus:border-orange-300 transition-all"
                                 autoFocus
+                                onKeyDown={e => { if (e.key === 'Enter' && editKey.trim()) handleSave(provider.id); }}
                               />
-                              <button
-                                onClick={() => setShowKey(!showKey)}
-                                className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-zinc-400 hover:text-zinc-600"
-                              >
+                              <button onClick={() => setShowKey(!showKey)} className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-zinc-400 hover:text-zinc-600">
                                 {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                               </button>
                             </div>
 
-                            {/* Test result inside edit form */}
                             {hasTestResult && (
                               <div className={`px-3 py-2 rounded-xl text-xs flex items-center gap-2 ${
-                                testResult.success
-                                  ? 'bg-green-50 text-green-700 border border-green-200'
-                                  : 'bg-red-50 text-red-700 border border-red-200'
+                                testResult.success ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-red-50 text-red-700 border border-red-200'
                               }`}>
                                 {testResult.success ? <ShieldCheck className="w-3.5 h-3.5" /> : <ShieldX className="w-3.5 h-3.5" />}
                                 {testResult.message}
                               </div>
                             )}
 
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
                               <button
                                 onClick={() => handleSave(provider.id)}
                                 disabled={!editKey.trim() || saving}
                                 className="px-4 py-2 rounded-xl text-xs font-medium bg-orange-600 text-white hover:bg-orange-700 disabled:bg-zinc-200 disabled:text-zinc-400 transition-all flex items-center gap-1.5"
                               >
-                                {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
-                                保存
+                                {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}保存
                               </button>
                               <button
                                 onClick={() => handleTest(provider.id)}
@@ -348,7 +535,7 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
                                 className="px-4 py-2 rounded-xl text-xs font-medium border border-zinc-200 text-zinc-600 hover:border-zinc-400 disabled:opacity-40 transition-all flex items-center gap-1.5"
                               >
                                 {isTesting ? <Loader2 className="w-3 h-3 animate-spin" /> : <FlaskConical className="w-3 h-3" />}
-                                测试
+                                测试并获取模型
                               </button>
                               <button
                                 onClick={() => { setEditingId(null); setEditKey(''); setShowKey(false); setTestResult(null); }}
@@ -356,27 +543,43 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
                               >
                                 取消
                               </button>
-                              <a
-                                href={provider.helpUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="ml-auto text-xs text-zinc-400 hover:text-orange-500 flex items-center gap-1 transition-colors"
-                              >
+                              <a href={provider.helpUrl} target="_blank" rel="noopener noreferrer" className="ml-auto text-xs text-zinc-400 hover:text-orange-500 flex items-center gap-1 transition-colors">
                                 获取密钥 <ExternalLink className="w-3 h-3" />
                               </a>
                             </div>
 
-                            {/* Available models */}
-                            <div className="pt-2 border-t border-zinc-100">
-                              <div className="text-[10px] text-zinc-400 font-medium uppercase tracking-widest mb-2">可用模型</div>
-                              <div className="flex flex-wrap gap-1.5">
-                                {provider.models.map(m => (
-                                  <span key={m.id} className="text-[11px] px-2 py-1 rounded-lg bg-zinc-50 text-zinc-600 border border-zinc-100">
-                                    {m.name}
-                                  </span>
-                                ))}
+                            {/* Models shown after successful test in edit mode */}
+                            {hasTestResult && testResult?.success && models.length > 0 && (
+                              <div className="pt-2 border-t border-zinc-100">
+                                <p className="text-[10px] text-zinc-400 font-medium uppercase tracking-widest mb-2">
+                                  已获取 {models.length} 个模型 · 点击选择
+                                </p>
+                                <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
+                                  {models.map(m => {
+                                    const isActive = activeModel?.modelId === m.id && activeModel?.providerId === provider.id;
+                                    return (
+                                      <button
+                                        key={m.id}
+                                        onClick={() => handleSetActiveModel(provider.id, m.id, m.name)}
+                                        disabled={settingActiveModel}
+                                        className={`w-full text-left px-3 py-2 rounded-xl text-xs flex items-center gap-2 transition-all ${
+                                          isActive ? 'bg-orange-50 border border-orange-200 text-orange-700' : 'hover:bg-zinc-50 border border-transparent text-zinc-600'
+                                        }`}
+                                      >
+                                        <div className={`w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
+                                          isActive ? 'border-orange-500 bg-orange-500' : 'border-zinc-300'
+                                        }`}>
+                                          {isActive && <div className="w-1 h-1 rounded-full bg-white" />}
+                                        </div>
+                                        <span className="flex-1 truncate font-medium">{m.name}</span>
+                                        {m.desc && <span className="text-[10px] text-zinc-400 flex-shrink-0">{m.desc}</span>}
+                                        {isActive && <span className="text-[9px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-600 font-semibold">当前</span>}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
                               </div>
-                            </div>
+                            )}
                           </div>
                         </motion.div>
                       )}
@@ -390,8 +593,7 @@ export default function ApiSettings({ open, onClose }: { open: boolean; onClose:
           {/* Footer */}
           <div className="px-6 md:px-8 py-4 border-t border-zinc-100 bg-zinc-50/50">
             <p className="text-[11px] text-zinc-400 leading-relaxed">
-              API 密钥安全存储在本地数据库中，不会上传到任何第三方服务。
-              实时语音面试使用 Google Gemini Live API，需要配置 Google API Key。
+              API 密钥安全存储于本地数据库。点击「测试并获取模型」可从服务商实时拉取全部可用模型，选择后即为题单生成模型。语音面试仅支持 Google Gemini Live API。
             </p>
           </div>
         </motion.div>
