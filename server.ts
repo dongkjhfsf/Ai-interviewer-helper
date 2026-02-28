@@ -31,8 +31,8 @@ function getErrorDetail(error: any): string {
     cause && typeof cause === "object" && "message" in cause
       ? String((cause as any).message)
       : cause
-      ? String(cause)
-      : "";
+        ? String(cause)
+        : "";
   return causeMessage ? `${name}: ${message} | cause: ${causeMessage}` : `${name}: ${message}`;
 }
 
@@ -273,16 +273,16 @@ async function generateWithOpenAICompatible(
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey.trim()}`,
       },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt + JSON_INSTRUCTION },
-      ],
-      response_format: { type: "json_object" },
-      temperature: 0.7,
-    }),
-  });
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt + JSON_INSTRUCTION },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.7,
+      }),
+    });
   } finally {
     clearTimeout(timer);
   }
@@ -507,6 +507,30 @@ async function startServer() {
     }
   });
 
+  app.put("/api/questions/batch/:id", (req, res) => {
+    try {
+      const { id } = req.params;
+      const { title } = req.body;
+      if (!title || typeof title !== "string" || !title.trim()) {
+        return res.status(400).json({ error: "title is required" });
+      }
+
+      if (id.startsWith('legacy-')) {
+        return res.status(400).json({ error: "Cannot rename legacy batches" });
+      }
+
+      const result = db.prepare("UPDATE question_batches SET title = ? WHERE id = ?").run(title.trim(), id);
+      if (result.changes > 0) {
+        res.json({ success: true });
+      } else {
+        res.status(404).json({ error: "Batch not found" });
+      }
+    } catch (error) {
+      console.error("Error renaming batch:", error);
+      res.status(500).json({ error: "Failed to rename batch" });
+    }
+  });
+
   app.get("/api/questions/batch/:id/practices", (req, res) => {
     try {
       const { id } = req.params;
@@ -564,6 +588,156 @@ async function startServer() {
     } catch (error) {
       console.error("Error deleting interview practice:", error);
       res.status(500).json({ error: "Failed to delete interview practice" });
+    }
+  });
+
+  // ============================================================
+  // Category Management Routes
+  // ============================================================
+
+  // Get all categories with their assigned batches
+  app.get("/api/categories", (req, res) => {
+    try {
+      const categories = db.prepare(`
+        SELECT id, name, parent_id, sort_order, created_at
+        FROM batch_categories
+        ORDER BY sort_order ASC, created_at ASC
+      `).all() as any[];
+
+      const assignments = db.prepare(`
+        SELECT bca.batch_id, bca.category_id, bca.sort_order
+        FROM batch_category_assignments bca
+        ORDER BY bca.sort_order ASC
+      `).all() as any[];
+
+      res.json({ categories, assignments });
+    } catch (error) {
+      console.error("Error fetching categories:", error);
+      res.status(500).json({ error: "Failed to fetch categories" });
+    }
+  });
+
+  // Create a new category
+  app.post("/api/categories", (req, res) => {
+    try {
+      const { name, parentId } = req.body;
+      if (!name || typeof name !== "string" || !name.trim()) {
+        return res.status(400).json({ error: "name is required" });
+      }
+
+      // Get the next sort_order
+      const maxOrder = db.prepare(
+        `SELECT COALESCE(MAX(sort_order), -1) as max_order FROM batch_categories WHERE parent_id IS ?`
+      ).get(parentId || null) as any;
+
+      const result = db.prepare(`
+        INSERT INTO batch_categories (name, parent_id, sort_order)
+        VALUES (?, ?, ?)
+      `).run(name.trim(), parentId || null, (maxOrder?.max_order ?? -1) + 1);
+
+      res.json({ success: true, id: result.lastInsertRowid });
+    } catch (error) {
+      console.error("Error creating category:", error);
+      res.status(500).json({ error: "Failed to create category" });
+    }
+  });
+
+  // Rename a category
+  app.put("/api/categories/:id", (req, res) => {
+    try {
+      const { id } = req.params;
+      const { name } = req.body;
+      if (!name || typeof name !== "string" || !name.trim()) {
+        return res.status(400).json({ error: "name is required" });
+      }
+
+      const result = db.prepare("UPDATE batch_categories SET name = ? WHERE id = ?").run(name.trim(), id);
+      if (result.changes > 0) {
+        res.json({ success: true });
+      } else {
+        res.status(404).json({ error: "Category not found" });
+      }
+    } catch (error) {
+      console.error("Error renaming category:", error);
+      res.status(500).json({ error: "Failed to rename category" });
+    }
+  });
+
+  // Delete a category
+  app.delete("/api/categories/:id", (req, res) => {
+    try {
+      db.exec("PRAGMA foreign_keys = ON");
+      const { id } = req.params;
+      const result = db.prepare("DELETE FROM batch_categories WHERE id = ?").run(id);
+      if (result.changes > 0) {
+        res.json({ success: true });
+      } else {
+        res.status(404).json({ error: "Category not found" });
+      }
+    } catch (error) {
+      console.error("Error deleting category:", error);
+      res.status(500).json({ error: "Failed to delete category" });
+    }
+  });
+
+  // Assign a batch to a category
+  app.post("/api/categories/:id/batches", (req, res) => {
+    try {
+      const { id } = req.params;
+      const { batchId } = req.body;
+      if (!batchId) {
+        return res.status(400).json({ error: "batchId is required" });
+      }
+
+      // Get the next sort_order within this category
+      const maxOrder = db.prepare(
+        `SELECT COALESCE(MAX(sort_order), -1) as max_order FROM batch_category_assignments WHERE category_id = ?`
+      ).get(id) as any;
+
+      db.prepare(`
+        INSERT OR IGNORE INTO batch_category_assignments (batch_id, category_id, sort_order)
+        VALUES (?, ?, ?)
+      `).run(batchId, id, (maxOrder?.max_order ?? -1) + 1);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error assigning batch to category:", error);
+      res.status(500).json({ error: "Failed to assign batch" });
+    }
+  });
+
+  // Remove a batch from a category
+  app.delete("/api/categories/:categoryId/batches/:batchId", (req, res) => {
+    try {
+      const { categoryId, batchId } = req.params;
+      db.prepare("DELETE FROM batch_category_assignments WHERE batch_id = ? AND category_id = ?").run(batchId, categoryId);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error removing batch from category:", error);
+      res.status(500).json({ error: "Failed to remove batch from category" });
+    }
+  });
+
+  // Reorder categories
+  app.put("/api/categories/reorder", (req, res) => {
+    try {
+      const { orders } = req.body;
+      if (!Array.isArray(orders)) {
+        return res.status(400).json({ error: "orders array is required" });
+      }
+
+      const stmt = db.prepare("UPDATE batch_categories SET sort_order = ? WHERE id = ?");
+      const transaction = db.transaction(() => {
+        for (const item of orders) {
+          stmt.run(item.sort_order, item.id);
+        }
+      });
+      transaction();
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error reordering categories:", error);
+      res.status(500).json({ error: "Failed to reorder categories" });
     }
   });
 
@@ -878,7 +1052,7 @@ async function startServer() {
       : findProviderForModel(modelToUse);
 
     try {
-      
+
       if (!providerDef) {
         return res.status(400).json({ error: `Cannot find provider for model: ${modelToUse}` });
       }
@@ -1021,8 +1195,9 @@ async function startServer() {
     app.use(express.static("dist"));
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  const HOST = process.env.HOST || "localhost";
+  app.listen(PORT, HOST, () => {
+    console.log(`Server running on http://${HOST}:${PORT}`);
   });
 }
 

@@ -62,3 +62,21 @@ INSERT OR IGNORE INTO modules (id, name, description) VALUES
 ('knowledge', 'Knowledge Module', 'Focuses on technical knowledge and concepts'),
 ('project', 'Project Module', 'Deep dive into your project experience'),
 ('scenario', 'Scenario Module', 'Situational and behavioral questions');
+
+CREATE TABLE IF NOT EXISTS batch_categories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  parent_id INTEGER DEFAULT NULL,
+  sort_order INTEGER DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(parent_id) REFERENCES batch_categories(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS batch_category_assignments (
+  batch_id INTEGER NOT NULL,
+  category_id INTEGER NOT NULL,
+  sort_order INTEGER DEFAULT 0,
+  PRIMARY KEY(batch_id, category_id),
+  FOREIGN KEY(batch_id) REFERENCES question_batches(id) ON DELETE CASCADE,
+  FOREIGN KEY(category_id) REFERENCES batch_categories(id) ON DELETE CASCADE
+);

@@ -99,24 +99,24 @@ export default function App() {
         />
       )}
       {step === 'history' && (
-        <HistoryPage onBack={() => setStep('setup')} />
+        <HistoryPage onBack={() => setStep('setup')} onReuseBatch={(batch) => { handleReuseBatch(batch); }} />
       )}
       {step === 'questions' && (
-        <QuestionList 
-          data={interviewData} 
-          onStart={() => setStep('interview')} 
+        <QuestionList
+          data={interviewData}
+          onStart={() => setStep('interview')}
         />
       )}
       {step === 'interview' && (
-        <InterviewRoom 
-          data={interviewData} 
-          onEnd={handleInterviewEnd} 
+        <InterviewRoom
+          data={interviewData}
+          onEnd={handleInterviewEnd}
         />
       )}
       {step === 'review' && (
-        <ReviewPage 
-          transcript={finalTranscript} 
-          onRestart={handleRestart} 
+        <ReviewPage
+          transcript={finalTranscript}
+          onRestart={handleRestart}
         />
       )}
     </div>

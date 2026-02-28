@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { ArrowLeft, Database, Clock, Trash2, ChevronRight, Download, ChevronDown, FileText } from 'lucide-react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
+import { ArrowLeft, Database, Clock, Trash2, ChevronRight, Download, ChevronDown, FileText, Plus, FolderOpen, Folder, Edit3, X, Check, GripVertical, ChevronUp, RotateCcw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -8,6 +8,19 @@ interface QuestionItemProps {
   question: any;
   index: number;
   key?: React.Key;
+}
+
+interface Category {
+  id: number;
+  name: string;
+  parent_id: number | null;
+  sort_order: number;
+}
+
+interface Assignment {
+  batch_id: number;
+  category_id: number;
+  sort_order: number;
 }
 
 async function parseJsonResponse(res: Response) {
@@ -27,12 +40,33 @@ async function parseJsonResponse(res: Response) {
   }
 }
 
-export default function HistoryPage({ onBack }: { onBack: () => void }) {
+export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => void; onReuseBatch?: (batch: any) => void }) {
   const [batches, setBatches] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [selectedBatch, setSelectedBatch] = useState<any | null>(null);
   const [deletingId, setDeletingId] = useState<string | number | null>(null);
+
+  // Category state
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [assignments, setAssignments] = useState<Assignment[]>([]);
+  const [expandedCategories, setExpandedCategories] = useState<Set<number>>(new Set());
+  const [newCategoryName, setNewCategoryName] = useState('');
+  const [addingSubcategoryFor, setAddingSubcategoryFor] = useState<number | null>(null);
+  const [subcategoryName, setSubcategoryName] = useState('');
+  const [editingCategoryId, setEditingCategoryId] = useState<number | null>(null);
+  const [editingCategoryName, setEditingCategoryName] = useState('');
+  const [dragOverCategoryId, setDragOverCategoryId] = useState<number | null>(null);
+  const [showNewCategoryInput, setShowNewCategoryInput] = useState(false);
+
+  // Batch rename state
+  const [editingBatchId, setEditingBatchId] = useState<number | string | null>(null);
+  const [editingBatchTitle, setEditingBatchTitle] = useState('');
+
+  // Track dragging origin for better UX and unassigning
+  const [draggingBatchId, setDraggingBatchId] = useState<number | string | null>(null);
+  const [dragSourceCategoryId, setDragSourceCategoryId] = useState<number | null>(null);
+  const [isDragOverLeftColumn, setIsDragOverLeftColumn] = useState(false);
 
   const fetchHistory = () => {
     setIsLoading(true);
@@ -50,9 +84,20 @@ export default function HistoryPage({ onBack }: { onBack: () => void }) {
       });
   };
 
+  const fetchCategories = useCallback(() => {
+    fetch('/api/categories', { credentials: 'omit' })
+      .then(parseJsonResponse)
+      .then(data => {
+        setCategories(data.categories || []);
+        setAssignments(data.assignments || []);
+      })
+      .catch(err => console.error('Failed to load categories', err));
+  }, []);
+
   useEffect(() => {
     fetchHistory();
-  }, []);
+    fetchCategories();
+  }, [fetchCategories]);
 
   const confirmDelete = async () => {
     if (deletingId === null || deletingId === undefined) {
@@ -64,6 +109,7 @@ export default function HistoryPage({ onBack }: { onBack: () => void }) {
       const res = await fetch(`/api/questions/batch/${deletingId}`, { method: 'DELETE' });
       if (res.ok) {
         fetchHistory();
+        fetchCategories();
         setDeletingId(null);
       } else {
         const errorData = await res.json().catch(() => ({ error: 'Unknown server error' }));
@@ -93,19 +139,482 @@ export default function HistoryPage({ onBack }: { onBack: () => void }) {
     URL.revokeObjectURL(url);
   };
 
+  // Category management
+  const createCategory = async (name: string, parentId?: number) => {
+    if (!name.trim()) return;
+    try {
+      const res = await fetch('/api/categories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim(), parentId: parentId || null }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        fetchCategories();
+        if (parentId) {
+          setExpandedCategories(prev => new Set([...prev, parentId]));
+        }
+        return data.id;
+      }
+    } catch (err) {
+      console.error('Failed to create category', err);
+    }
+  };
+
+  const renameCategory = async (id: number, name: string) => {
+    if (!name.trim()) return;
+    try {
+      await fetch(`/api/categories/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim() }),
+      });
+      fetchCategories();
+    } catch (err) {
+      console.error('Failed to rename category', err);
+    }
+  };
+
+  const deleteCategory = async (id: number) => {
+    try {
+      await fetch(`/api/categories/${id}`, { method: 'DELETE' });
+      fetchCategories();
+    } catch (err) {
+      console.error('Failed to delete category', err);
+    }
+  };
+
+  const assignBatchToCategory = async (batchId: number | string, categoryId: number) => {
+    if (typeof batchId === 'string' && batchId.startsWith('legacy-')) return;
+    try {
+      await fetch(`/api/categories/${categoryId}/batches`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batchId }),
+      });
+      fetchCategories();
+    } catch (err) {
+      console.error('Failed to assign batch', err);
+    }
+  };
+
+  const removeBatchFromCategory = async (batchId: number | string, categoryId: number) => {
+    try {
+      await fetch(`/api/categories/${categoryId}/batches/${batchId}`, { method: 'DELETE' });
+      fetchCategories();
+    } catch (err) {
+      console.error('Failed to remove batch from category', err);
+    }
+  };
+
+  const toggleCategory = (id: number) => {
+    setExpandedCategories(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // Batch renaming
+  const renameBatch = async (id: number | string, newTitle: string) => {
+    if (!newTitle.trim() || String(id).startsWith('legacy-')) return;
+    try {
+      const res = await fetch(`/api/questions/batch/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: newTitle.trim() }),
+      });
+      if (res.ok) {
+        fetchHistory();
+      } else {
+        alert('Failed to rename batch');
+      }
+    } catch (err) {
+      console.error('Failed to rename batch', err);
+    }
+  };
+
+  // Drag and drop handlers
+  const handleDragStart = (e: React.DragEvent, batch: any, sourceCategoryId: number | null = null) => {
+    e.dataTransfer.setData('application/json', JSON.stringify({ batchId: batch.id, type: 'batch', sourceCategoryId }));
+    e.dataTransfer.effectAllowed = 'copyMove';
+    setDraggingBatchId(batch.id);
+    setDragSourceCategoryId(sourceCategoryId);
+
+    // Slight delay to allow the native drag image to capture the full element before changing styling
+    setTimeout(() => {
+      const el = e.target as HTMLElement;
+      if (el) el.style.opacity = '0.4';
+    }, 0);
+  };
+
+  const handleDragEnd = (e: React.DragEvent) => {
+    setDraggingBatchId(null);
+    setDragSourceCategoryId(null);
+    setIsDragOverLeftColumn(false);
+    const el = e.target as HTMLElement;
+    if (el) el.style.opacity = '1';
+  };
+
+  const handleDragOver = (e: React.DragEvent, categoryId: number | 'left') => {
+    e.preventDefault();
+    if (categoryId === 'left') {
+      e.dataTransfer.dropEffect = 'move';
+      setIsDragOverLeftColumn(true);
+      setDragOverCategoryId(null);
+    } else {
+      e.dataTransfer.dropEffect = 'copy';
+      setDragOverCategoryId(categoryId);
+      setIsDragOverLeftColumn(false);
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent, target: 'left' | 'cat') => {
+    if (target === 'left') {
+      setIsDragOverLeftColumn(false);
+    } else {
+      setDragOverCategoryId(null);
+    }
+  };
+
+  const handleDrop = async (e: React.DragEvent, targetId: number | 'left') => {
+    e.preventDefault();
+    setDragOverCategoryId(null);
+    setIsDragOverLeftColumn(false);
+    try {
+      const data = JSON.parse(e.dataTransfer.getData('application/json'));
+      if (data.type === 'batch' && data.batchId) {
+        if (targetId === 'left') {
+          // Unassign from its category
+          if (data.sourceCategoryId) {
+            await removeBatchFromCategory(data.batchId, data.sourceCategoryId);
+          }
+        } else {
+          // Assign to new category
+          if (data.sourceCategoryId && data.sourceCategoryId !== targetId) {
+            // Optional: if moving within categories, we don't have a 1-to-1 strict tree (it's many-to-many in DB),
+            // but UX-wise we might remove from old and add to new to feel like a strict folder move.
+            await removeBatchFromCategory(data.batchId, data.sourceCategoryId);
+          }
+          await assignBatchToCategory(data.batchId, targetId);
+        }
+      }
+    } catch (err) {
+      console.error('Drop error:', err);
+    }
+  };
+
+  // Helper: get child categories
+  const getChildCategories = (parentId: number | null) =>
+    categories.filter(c => c.parent_id === parentId).sort((a, b) => a.sort_order - b.sort_order);
+
+  // Helper: get batches assigned to a category
+  const getBatchesForCategory = (categoryId: number) => {
+    const batchIds = assignments.filter(a => a.category_id === categoryId).map(a => a.batch_id);
+    return batches.filter(b => batchIds.includes(b.id));
+  };
+
   if (selectedBatch) {
     return (
       <BatchDetail
         batch={selectedBatch}
         onBack={() => setSelectedBatch(null)}
         onExport={() => handleExportMd(selectedBatch)}
+        onReuseBatch={onReuseBatch}
       />
     );
   }
 
+  // Render a category node (recursive for tree structure)
+  const renderCategory = (cat: Category, depth: number = 0) => {
+    const isExpanded = expandedCategories.has(cat.id);
+    const children = getChildCategories(cat.id);
+    const categoryBatches = getBatchesForCategory(cat.id);
+    const isEditing = editingCategoryId === cat.id;
+    const isDragOver = dragOverCategoryId === cat.id;
+    const isAddingSub = addingSubcategoryFor === cat.id;
+
+    return (
+      <div key={cat.id} className="select-none">
+        <div
+          className={`flex items-center gap-2 px-3 py-2.5 rounded-xl cursor-pointer transition-all group/cat ${isDragOver
+            ? 'bg-orange-100 border-2 border-dashed border-orange-400 shadow-inner'
+            : 'hover:bg-zinc-100 border-2 border-transparent'
+            }`}
+          style={{ paddingLeft: `${12 + depth * 20}px` }}
+          onDragOver={(e) => handleDragOver(e, cat.id)}
+          onDragLeave={(e) => handleDragLeave(e, 'cat')}
+          onDrop={(e) => handleDrop(e, cat.id)}
+          onClick={() => !isEditing && toggleCategory(cat.id)}
+        >
+          <button
+            className="p-0.5 text-zinc-400 hover:text-zinc-600 transition-colors"
+            onClick={(e) => { e.stopPropagation(); toggleCategory(cat.id); }}
+          >
+            {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          </button>
+
+          {isExpanded ? (
+            <FolderOpen className="w-4 h-4 text-orange-500 flex-shrink-0" />
+          ) : (
+            <Folder className="w-4 h-4 text-orange-400 flex-shrink-0" />
+          )}
+
+          {isEditing ? (
+            <div className="flex items-center gap-1 flex-1" onClick={(e) => e.stopPropagation()}>
+              <input
+                type="text"
+                value={editingCategoryName}
+                onChange={(e) => setEditingCategoryName(e.target.value)}
+                className="flex-1 text-sm px-2 py-1 border border-orange-300 rounded-lg outline-none focus:ring-2 focus:ring-orange-200 bg-white"
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    renameCategory(cat.id, editingCategoryName);
+                    setEditingCategoryId(null);
+                  } else if (e.key === 'Escape') {
+                    setEditingCategoryId(null);
+                  }
+                }}
+              />
+              <button
+                onClick={() => { renameCategory(cat.id, editingCategoryName); setEditingCategoryId(null); }}
+                className="p-1 text-green-600 hover:bg-green-50 rounded-lg"
+              >
+                <Check className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={() => setEditingCategoryId(null)}
+                className="p-1 text-zinc-400 hover:bg-zinc-100 rounded-lg"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ) : (
+            <>
+              <span className="flex-1 text-sm font-medium text-zinc-700 truncate">{cat.name}</span>
+              <span className="text-[10px] text-zinc-400 mr-1">
+                {categoryBatches.length > 0 && `${categoryBatches.length}`}
+              </span>
+              <div className="flex items-center gap-0.5 opacity-0 group-hover/cat:opacity-100 transition-opacity">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setAddingSubcategoryFor(isAddingSub ? null : cat.id);
+                    setSubcategoryName('');
+                  }}
+                  className="p-1 text-zinc-400 hover:text-orange-500 hover:bg-orange-50 rounded-lg transition-colors"
+                  title="添加子分类"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEditingCategoryId(cat.id);
+                    setEditingCategoryName(cat.name);
+                  }}
+                  className="p-1 text-zinc-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-colors"
+                  title="重命名"
+                >
+                  <Edit3 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (confirm(`确认删除分类 "${cat.name}" 吗？`)) deleteCategory(cat.id);
+                  }}
+                  className="p-1 text-zinc-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                  title="删除分类"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Subcategory creation input */}
+        <AnimatePresence>
+          {isAddingSub && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden"
+            >
+              <div className="flex items-center gap-2 py-2" style={{ paddingLeft: `${32 + depth * 20}px` }}>
+                <input
+                  type="text"
+                  value={subcategoryName}
+                  onChange={(e) => setSubcategoryName(e.target.value)}
+                  placeholder="子分类名称..."
+                  className="flex-1 text-sm px-3 py-1.5 border border-zinc-200 rounded-lg outline-none focus:border-orange-300 focus:ring-2 focus:ring-orange-100 bg-white"
+                  autoFocus
+                  onKeyDown={async (e) => {
+                    if (e.key === 'Enter' && subcategoryName.trim()) {
+                      await createCategory(subcategoryName, cat.id);
+                      setSubcategoryName('');
+                      setAddingSubcategoryFor(null);
+                    } else if (e.key === 'Escape') {
+                      setAddingSubcategoryFor(null);
+                    }
+                  }}
+                />
+                <button
+                  onClick={async () => {
+                    if (subcategoryName.trim()) {
+                      await createCategory(subcategoryName, cat.id);
+                      setSubcategoryName('');
+                      setAddingSubcategoryFor(null);
+                    }
+                  }}
+                  className="p-1.5 text-green-600 hover:bg-green-50 rounded-lg"
+                >
+                  <Check className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={() => setAddingSubcategoryFor(null)}
+                  className="p-1.5 text-zinc-400 hover:bg-zinc-100 rounded-lg"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Expanded content: assigned batches + children */}
+        <AnimatePresence>
+          {isExpanded && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden"
+            >
+              {/* Batches in this category */}
+              {categoryBatches.map(batch => {
+                const isBatchEditing = editingBatchId === batch.id;
+                return (
+                  <div
+                    key={`cat-batch-${cat.id}-${batch.id}`}
+                    draggable
+                    onDragStart={(e) => handleDragStart(e, batch, cat.id)}
+                    onDragEnd={handleDragEnd}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors group/item cursor-grab active:cursor-grabbing select-none ${draggingBatchId === batch.id ? 'opacity-40' : 'hover:bg-orange-50/50'
+                      }`}
+                    style={{ paddingLeft: `${32 + depth * 20}px` }}
+                    onClick={(e) => {
+                      if (!isBatchEditing) {
+                        setSelectedBatch(batch);
+                      }
+                    }}
+                  >
+                    <GripVertical className="w-3.5 h-3.5 text-zinc-300 opacity-0 group-hover/item:opacity-100 flex-shrink-0 transition-opacity" />
+                    <Database className="w-3.5 h-3.5 text-orange-400 flex-shrink-0" />
+
+                    {isBatchEditing ? (
+                      <div className="flex-1 flex items-center gap-1" onClick={e => e.stopPropagation()}>
+                        <input
+                          type="text"
+                          value={editingBatchTitle}
+                          onChange={(e) => setEditingBatchTitle(e.target.value)}
+                          className="flex-1 text-xs px-2 py-1 border border-orange-300 rounded outline-none focus:ring-1 focus:ring-orange-200"
+                          autoFocus
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              renameBatch(batch.id, editingBatchTitle);
+                              setEditingBatchId(null);
+                            } else if (e.key === 'Escape') setEditingBatchId(null);
+                          }}
+                        />
+                        <button onClick={() => { renameBatch(batch.id, editingBatchTitle); setEditingBatchId(null); }} className="p-0.5 text-green-600 hover:bg-green-50 rounded">
+                          <Check className="w-3 h-3" />
+                        </button>
+                        <button onClick={() => setEditingBatchId(null)} className="p-0.5 text-zinc-400 hover:bg-zinc-100 rounded">
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="text-sm text-zinc-600 truncate flex-1 group-hover/item:text-orange-600 transition-colors">
+                        {batch.title}
+                      </span>
+                    )}
+
+                    {!isBatchEditing && (
+                      <span className="text-[10px] text-zinc-400 flex-shrink-0">
+                        {batch.questions?.length || 0}题
+                      </span>
+                    )}
+
+                    {!isBatchEditing && !String(batch.id).startsWith('legacy-') && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditingBatchId(batch.id);
+                          setEditingBatchTitle(batch.title);
+                        }}
+                        className="p-1 min-w-5 h-5 flex items-center justify-center text-zinc-300 hover:text-blue-500 rounded-lg opacity-0 group-hover/item:opacity-100 transition-all ml-1 bg-white hover:bg-blue-50/50 shadow-sm border border-transparent hover:border-blue-100"
+                        title="重命名题单"
+                      >
+                        <Edit3 className="w-3 h-3" />
+                      </button>
+                    )}
+                    {!isBatchEditing && onReuseBatch && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onReuseBatch(batch);
+                        }}
+                        className="p-1 min-w-5 h-5 flex items-center justify-center text-zinc-300 hover:text-orange-500 rounded-lg opacity-0 group-hover/item:opacity-100 transition-all ml-1 bg-white hover:bg-orange-50/50 shadow-sm border border-transparent hover:border-orange-100"
+                        title="重新面试此题单"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                      </button>
+                    )}
+                    {!isBatchEditing && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeBatchFromCategory(batch.id, cat.id);
+                        }}
+                        className="p-1 min-w-5 h-5 flex items-center justify-center text-zinc-300 hover:text-red-500 rounded-lg opacity-0 group-hover/item:opacity-100 transition-all ml-1 bg-white hover:bg-red-50/50 shadow-sm border border-transparent hover:border-red-100"
+                        title="从分类移除"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* Child categories */}
+              {children.map(child => renderCategory(child, depth + 1))}
+
+              {/* Empty state */}
+              {categoryBatches.length === 0 && children.length === 0 && (
+                <div
+                  className={`text-xs text-zinc-400 py-3 text-center italic ${isDragOver ? 'text-orange-500' : ''
+                    }`}
+                  style={{ paddingLeft: `${32 + depth * 20}px` }}
+                >
+                  拖拽题单到此分类
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    );
+  };
+
+  const topLevelCategories = getChildCategories(null);
+
   return (
     <div className="min-h-screen bg-[#f8f9fa] text-zinc-900 p-8 font-sans">
-      <div className="max-w-4xl mx-auto">
+      <div className="max-w-7xl mx-auto">
         <button
           onClick={onBack}
           className="flex items-center gap-2 text-zinc-500 hover:text-zinc-900 transition-colors mb-8"
@@ -114,7 +623,7 @@ export default function HistoryPage({ onBack }: { onBack: () => void }) {
           <span className="text-sm font-medium">Back to Setup</span>
         </button>
 
-        <div className="mb-12">
+        <div className="mb-10">
           <h1 className="text-4xl font-light tracking-tight mb-2 flex items-center gap-3">
             <Database className="w-8 h-8 text-orange-600" />
             Interview <span className="font-serif italic text-orange-600">Sets</span>
@@ -135,61 +644,227 @@ export default function HistoryPage({ onBack }: { onBack: () => void }) {
             No question sets generated yet.
           </div>
         ) : (
-          <div className="grid gap-4">
-            {batches.map((batch, i) => (
-              <motion.div
-                key={batch.id}
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: i * 0.03 }}
-                className="group bg-white rounded-2xl shadow-sm border border-zinc-100 hover:border-orange-200 hover:shadow-md transition-all flex items-stretch overflow-hidden"
-              >
-                <div
-                  onClick={() => setSelectedBatch(batch)}
-                  className="flex-1 p-6 cursor-pointer flex items-center justify-between"
-                >
-                  <div className="flex items-start gap-4">
-                    <div className="w-12 h-12 rounded-xl bg-orange-50 flex items-center justify-center text-orange-600">
-                      <Database className="w-6 h-6" />
+          <div className="grid grid-cols-1 lg:grid-cols-[3fr_7fr] gap-6">
+            {/* Left Column: All Question Sets */}
+            <div
+              className={`rounded-3xl border-2 transition-all p-2 -mx-2 -mt-2 ${isDragOverLeftColumn ? 'border-dashed border-orange-400 bg-orange-50/50' : 'border-transparent'
+                }`}
+              onDragOver={(e) => handleDragOver(e, 'left')}
+              onDragLeave={(e) => handleDragLeave(e, 'left')}
+              onDrop={(e) => handleDrop(e, 'left')}
+            >
+              <div className="flex items-center gap-2 mb-4 px-3 mt-2">
+                <Database className="w-4 h-4 text-zinc-400" />
+                <h2 className="text-sm font-semibold text-zinc-500 uppercase tracking-wider">未分配题单</h2>
+                <span className="text-xs text-zinc-400 ml-auto">
+                  {batches.filter(b => !assignments.some(a => a.batch_id === b.id)).length} 个题单 · 拖拽到右侧分类
+                </span>
+              </div>
+              <div className="grid gap-3 px-2">
+                {batches
+                  .filter(b => !assignments.some(a => a.batch_id === b.id))
+                  .map((batch, i) => {
+                    const isBatchEditing = editingBatchId === batch.id;
+                    return (
+                      <motion.div
+                        key={batch.id}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: i * 0.02 }}
+                        draggable
+                        onDragStart={(e: any) => handleDragStart(e, batch, null)}
+                        onDragEnd={handleDragEnd as any}
+                        className={`group bg-white rounded-2xl shadow-sm border border-zinc-100 hover:border-orange-200 hover:shadow-md transition-all flex items-stretch overflow-hidden cursor-grab active:cursor-grabbing ${draggingBatchId === batch.id ? 'opacity-40 scale-[0.98]' : ''
+                          }`}
+                      >
+                        <div className="flex items-center px-2 text-zinc-300 group-hover:text-zinc-400 transition-colors">
+                          <GripVertical className="w-4 h-4" />
+                        </div>
+                        <div
+                          onClick={() => {
+                            if (!isBatchEditing) setSelectedBatch(batch);
+                          }}
+                          className="flex-1 p-5 cursor-pointer flex items-center justify-between"
+                        >
+                          <div className="flex items-start gap-3 flex-1 min-w-0">
+                            <div className="w-10 h-10 rounded-xl bg-orange-50 flex items-center justify-center text-orange-600 flex-shrink-0">
+                              <Database className="w-5 h-5" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2 mb-1">
+                                <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-zinc-100 text-zinc-600">
+                                  {batch.module_id}
+                                </span>
+                                <span className="text-zinc-400 text-[11px] flex items-center gap-1">
+                                  <Clock className="w-3 h-3" />
+                                  {new Date(batch.created_at).toLocaleDateString()}
+                                </span>
+                              </div>
+
+                              {isBatchEditing ? (
+                                <div className="flex items-center gap-2 mb-1" onClick={e => e.stopPropagation()}>
+                                  <input
+                                    type="text"
+                                    value={editingBatchTitle}
+                                    onChange={(e) => setEditingBatchTitle(e.target.value)}
+                                    className="flex-1 text-base font-medium px-2 py-1 border border-orange-300 rounded-lg outline-none focus:ring-2 focus:ring-orange-200"
+                                    autoFocus
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        renameBatch(batch.id, editingBatchTitle);
+                                        setEditingBatchId(null);
+                                      } else if (e.key === 'Escape') setEditingBatchId(null);
+                                    }}
+                                  />
+                                  <button onClick={() => { renameBatch(batch.id, editingBatchTitle); setEditingBatchId(null); }} className="p-1.5 text-green-600 hover:bg-green-50 rounded-lg shrink-0">
+                                    <Check className="w-4 h-4" />
+                                  </button>
+                                  <button onClick={() => setEditingBatchId(null)} className="p-1.5 text-zinc-400 hover:bg-zinc-100 rounded-lg shrink-0">
+                                    <X className="w-4 h-4" />
+                                  </button>
+                                </div>
+                              ) : (
+                                <h2 className="text-base font-medium text-zinc-800 group-hover:text-orange-600 transition-colors truncate">
+                                  {batch.title}
+                                </h2>
+                              )}
+
+                              {!isBatchEditing && (
+                                <p className="text-zinc-400 text-xs mt-1">
+                                  {batch.questions.length} questions · {(batch.practice_count || 0)} practices
+                                </p>
+                              )}
+                            </div>
+                          </div>
+
+                          {!isBatchEditing && (
+                            <div className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity ml-2 gap-1.5">
+                              {onReuseBatch && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    onReuseBatch(batch);
+                                  }}
+                                  className="p-1.5 min-w-8 h-8 flex items-center justify-center text-zinc-400 hover:text-orange-500 rounded-full hover:bg-orange-50 transition-colors bg-zinc-50/50 shadow-sm"
+                                  title="重新面试此题单"
+                                >
+                                  <RotateCcw className="w-4 h-4" />
+                                </button>
+                              )}
+                              {!String(batch.id).startsWith('legacy-') && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEditingBatchId(batch.id);
+                                    setEditingBatchTitle(batch.title);
+                                  }}
+                                  className="p-1.5 min-w-8 h-8 flex items-center justify-center text-zinc-400 hover:text-blue-500 rounded-full hover:bg-blue-50 transition-colors bg-zinc-50/50 shadow-sm"
+                                  title="重命名题单"
+                                >
+                                  <Edit3 className="w-4 h-4" />
+                                </button>
+                              )}
+                              <ChevronRight className="w-5 h-5 text-zinc-300 group-hover:text-orange-400 transition-colors ml-1" />
+                            </div>
+                          )}
+                        </div>
+
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const id = batch.id;
+                            if (id === undefined || id === null) {
+                              alert('Cannot delete: batch has no ID.');
+                              return;
+                            }
+                            setDeletingId(id);
+                          }}
+                          className="px-4 border-l border-zinc-50 hover:bg-red-50 text-zinc-300 hover:text-red-500 transition-colors group/del"
+                          title="永久删除"
+                        >
+                          <Trash2 className="w-4 h-4 group-hover/del:scale-110 transition-transform" />
+                        </button>
+                      </motion.div>
+                    )
+                  })}
+              </div>
+            </div>
+
+            {/* Right Column: Categories */}
+            <div className="pt-2">
+              <div className="flex items-center gap-2 mb-4 px-1">
+                <FolderOpen className="w-4 h-4 text-orange-500" />
+                <h2 className="text-sm font-semibold text-zinc-500 uppercase tracking-wider">我的分类</h2>
+              </div>
+              <div className="bg-white rounded-2xl shadow-sm border border-zinc-100 overflow-hidden">
+                <div className="p-4">
+                  {/* Category tree */}
+                  {topLevelCategories.length > 0 ? (
+                    <div className="space-y-0.5">
+                      {topLevelCategories.map(cat => renderCategory(cat))}
                     </div>
-                    <div>
-                      <div className="flex items-center gap-3 mb-1">
-                        <span className="text-xs font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-zinc-100 text-zinc-600">
-                          {batch.module_id}
-                        </span>
-                        <span className="text-zinc-400 text-[11px] flex items-center gap-1">
-                          <Clock className="w-3 h-3" />
-                          {new Date(batch.created_at).toLocaleDateString()}
-                        </span>
-                      </div>
-                      <h2 className="text-lg font-medium text-zinc-800 group-hover:text-orange-600 transition-colors">
-                        {batch.title}
-                      </h2>
-                      <p className="text-zinc-400 text-xs">
-                        {batch.questions.length} questions included · {(batch.practice_count || 0)} practice records
-                      </p>
+                  ) : (
+                    <div className="text-center py-8 text-zinc-400">
+                      <Folder className="w-10 h-10 mx-auto mb-3 text-zinc-300" />
+                      <p className="text-sm mb-1">还没有分类</p>
+                      <p className="text-xs text-zinc-400">创建分类并拖拽题单进行整理</p>
                     </div>
-                  </div>
-                  <ChevronRight className="w-5 h-5 text-zinc-300 group-hover:text-orange-500 transition-colors" />
+                  )}
                 </div>
 
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    const id = batch.id;
-                    console.log('Delete clicked, batch.id =', id, ', batch =', batch);
-                    if (id === undefined || id === null) {
-                      alert('Cannot delete: batch has no ID. Raw batch: ' + JSON.stringify(batch));
-                      return;
-                    }
-                    setDeletingId(id);
-                  }}
-                  className="px-6 border-l border-zinc-50 hover:bg-red-50 text-zinc-300 hover:text-red-500 transition-colors group/del"
-                >
-                  <Trash2 className="w-5 h-5 group-hover/del:scale-110 transition-transform" />
-                </button>
-              </motion.div>
-            ))}
+                {/* New category input */}
+                <div className="border-t border-zinc-100 p-3">
+                  {showNewCategoryInput ? (
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={newCategoryName}
+                        onChange={(e) => setNewCategoryName(e.target.value)}
+                        placeholder="分类名称, 如: C++、音视频..."
+                        className="flex-1 text-sm px-3 py-2 border border-zinc-200 rounded-xl outline-none focus:border-orange-300 focus:ring-2 focus:ring-orange-100 bg-zinc-50"
+                        autoFocus
+                        onKeyDown={async (e) => {
+                          if (e.key === 'Enter' && newCategoryName.trim()) {
+                            await createCategory(newCategoryName);
+                            setNewCategoryName('');
+                            setShowNewCategoryInput(false);
+                          } else if (e.key === 'Escape') {
+                            setShowNewCategoryInput(false);
+                            setNewCategoryName('');
+                          }
+                        }}
+                      />
+                      <button
+                        onClick={async () => {
+                          if (newCategoryName.trim()) {
+                            await createCategory(newCategoryName);
+                            setNewCategoryName('');
+                            setShowNewCategoryInput(false);
+                          }
+                        }}
+                        className="p-2 text-green-600 hover:bg-green-50 rounded-xl transition-colors"
+                      >
+                        <Check className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={() => { setShowNewCategoryInput(false); setNewCategoryName(''); }}
+                        className="p-2 text-zinc-400 hover:bg-zinc-100 rounded-xl transition-colors"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setShowNewCategoryInput(true)}
+                      className="w-full flex items-center justify-center gap-2 py-2 text-sm text-zinc-500 hover:text-orange-600 hover:bg-orange-50 rounded-xl transition-colors"
+                    >
+                      <Plus className="w-4 h-4" />
+                      新建分类
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -233,7 +908,7 @@ export default function HistoryPage({ onBack }: { onBack: () => void }) {
   );
 }
 
-function BatchDetail({ batch, onBack, onExport }: { batch: any, onBack: () => void, onExport: () => void }) {
+function BatchDetail({ batch, onBack, onExport, onReuseBatch }: { batch: any, onBack: () => void, onExport: () => void, onReuseBatch?: (batch: any) => void }) {
   const [practices, setPractices] = useState<any[]>([]);
   const [isPracticesLoading, setIsPracticesLoading] = useState(false);
   const [practicesError, setPracticesError] = useState<string | null>(null);
@@ -311,21 +986,34 @@ function BatchDetail({ batch, onBack, onExport }: { batch: any, onBack: () => vo
     <div className="min-h-screen bg-white text-zinc-900 p-8">
       <div className="max-w-5xl mx-auto">
         <div className="flex items-center justify-between mb-12">
-          <button
-            onClick={onBack}
-            className="flex items-center gap-2 text-zinc-500 hover:text-zinc-900 transition-colors"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            <span className="text-sm font-medium">Back to History</span>
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onBack}
+              className="flex items-center gap-2 text-zinc-500 hover:text-zinc-900 transition-colors"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <span className="text-sm font-medium">Back to History</span>
+            </button>
+          </div>
 
-          <button
-            onClick={onExport}
-            className="px-6 py-2.5 bg-zinc-900 text-white rounded-full text-sm font-medium hover:bg-zinc-800 transition-colors flex items-center gap-2"
-          >
-            <Download className="w-4 h-4" />
-            Export MD
-          </button>
+          <div className="flex items-center gap-2">
+            {onReuseBatch && (
+              <button
+                onClick={() => onReuseBatch(batch)}
+                className="px-5 py-2.5 rounded-full text-sm font-medium flex items-center gap-2 border border-orange-300 bg-orange-50 text-orange-700 hover:bg-orange-100 hover:border-orange-400 transition-colors"
+              >
+                <RotateCcw className="w-4 h-4" />
+                重新面试
+              </button>
+            )}
+            <button
+              onClick={onExport}
+              className="px-6 py-2.5 bg-zinc-900 text-white rounded-full text-sm font-medium hover:bg-zinc-800 transition-colors flex items-center gap-2"
+            >
+              <Download className="w-4 h-4" />
+              Export MD
+            </button>
+          </div>
         </div>
 
         <div className="mb-12">
@@ -493,4 +1181,3 @@ function QuestionItem({ question, index }: QuestionItemProps) {
     </div>
   );
 }
-

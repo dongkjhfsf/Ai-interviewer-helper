@@ -101,6 +101,8 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
   // Audio playback queue
   const audioQueueRef = useRef<Float32Array[]>([]);
   const nextPlayTimeRef = useRef(0);
+  // Track all active (scheduled) BufferSourceNodes so we can stop & cleanup
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   // Track if AI is currently playing audio
   const isSpeakingRef = useRef(false);
   const speakingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -112,6 +114,8 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
   // Track if AI has ever sent audio in this session — used to prevent
   // pointless reconnect loops when the model never actually responds.
   const hasReceivedAiAudioRef = useRef(false);
+  // Delayed flush timer for user transcription — prevents tail truncation
+  const turnCompleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Accumulate partial transcription text
   // These accumulate across multiple messages within a single turn
@@ -253,12 +257,24 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
     setLiveUserText('');
     setLiveAiText('');
 
+    // Clear turnComplete delayed flush timer
+    if (turnCompleteTimerRef.current) {
+      clearTimeout(turnCompleteTimerRef.current);
+      turnCompleteTimerRef.current = null;
+    }
+
     // Clear reconnect countdown
     if (reconnectCountdownRef.current) {
       clearInterval(reconnectCountdownRef.current);
       reconnectCountdownRef.current = null;
     }
     setReconnectCountdown(null);
+
+    // Stop and disconnect all active audio sources to prevent ghost playback
+    for (const src of activeSourcesRef.current) {
+      try { src.stop(); src.disconnect(); } catch (_) { }
+    }
+    activeSourcesRef.current.clear();
 
     if (workletNodeRef.current) {
       workletNodeRef.current.disconnect();
@@ -353,7 +369,7 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
       if (pendingUserTextRef.current.trim() || liveUserText.trim()) {
         setAiStatus('thinking');
       }
-    } catch (_) {}
+    } catch (_) { }
   };
 
   const pcmToBase64 = (pcmData: Int16Array) => {
@@ -387,6 +403,13 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
       await playbackContextRef.current.resume();
 
       // 2. Get Microphone Access
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error(
+          '浏览器无法访问麦克风 API（navigator.mediaDevices 不可用）。\n' +
+          '请确保通过 HTTPS 或 localhost 访问本页面。' +
+          (window.isSecureContext ? '' : '\n当前页面不是安全上下文（Secure Context），浏览器已禁用媒体设备访问。')
+        );
+      }
       mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -421,7 +444,9 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
       animationRef.current = requestAnimationFrame(updateVolume);
 
       // Use ScriptProcessor for audio capture (wider browser support)
-      const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+      // Use 2048 buffer (128ms @ 16kHz) instead of 4096 (256ms) for lower latency
+      // and reduced impact of single-packet loss on transcription
+      const processor = audioContextRef.current.createScriptProcessor(2048, 1, 1);
       workletNodeRef.current = processor;
 
       // 3. Setup Gemini Live API
@@ -611,7 +636,13 @@ ${questionsContext}
     // Handle interruption
     if (sc.interrupted) {
       console.log('[LiveAPI] Interrupted');
+      // Clear pending audio queue
       audioQueueRef.current = [];
+      // Stop ALL currently scheduled/playing audio sources immediately
+      for (const src of activeSourcesRef.current) {
+        try { src.stop(); src.disconnect(); } catch (_) { }
+      }
+      activeSourcesRef.current.clear();
       if (playbackContextRef.current) {
         nextPlayTimeRef.current = playbackContextRef.current.currentTime;
       }
@@ -627,17 +658,56 @@ ${questionsContext}
     }
 
     // Handle input transcription (user's spoken text)
-    // This arrives asynchronously and may come DURING or AFTER the AI's response
-    // We flush user text BEFORE starting a new model turn to maintain order
+    // This arrives asynchronously and may come DURING or AFTER the AI's response.
+    //
+    // KEY SCENARIO: Gemini's VAD may trigger mid-sentence (user pauses briefly),
+    // causing the model to start responding while the user is still speaking.
+    // In this case, inputTranscription arrives AFTER modelTurn has already started
+    // and we've already flushed the first part of user text into a bubble.
+    // We must APPEND to that existing bubble instead of creating a new orphan.
     if (sc.inputTranscription?.text) {
-      // If we were in a model turn, flush any pending AI text first (in case of overlap)
       if (currentTurnRoleRef.current === 'model') {
-        flushPendingAiText();
+        // Late-arriving user transcription during an active model turn.
+        // Retroactively append to the last user bubble in the transcript
+        // instead of creating a new orphaned entry.
+        const sanitized = sanitizeTranscript(sc.inputTranscription.text);
+        if (sanitized) {
+          setTranscript(prev => {
+            // Find the last user entry to append to
+            const lastUserIdx = prev.length - 1 - [...prev].reverse().findIndex(t => t.role === 'user');
+            if (lastUserIdx >= 0 && lastUserIdx < prev.length) {
+              const updated = [...prev];
+              updated[lastUserIdx] = {
+                ...updated[lastUserIdx],
+                text: updated[lastUserIdx].text + sanitized,
+              };
+              return updated;
+            }
+            // No previous user entry found — shouldn't happen, but just in case,
+            // create a new one
+            return [...prev, { role: 'user' as const, text: sanitized }];
+          });
+        }
+        // DON'T change currentTurnRoleRef — we're still in model turn
+        // DON'T flush AI text — model is still generating
+      } else {
+        // Normal case: user is speaking, no model turn active
+        currentTurnRoleRef.current = 'user';
+        pendingUserTextRef.current += sc.inputTranscription.text;
+        // Update live preview so user can see real-time transcription as they speak
+        setLiveUserText(pendingUserTextRef.current);
       }
-      currentTurnRoleRef.current = 'user';
-      pendingUserTextRef.current += sc.inputTranscription.text;
-      // Update live preview so user can see real-time transcription as they speak
-      setLiveUserText(pendingUserTextRef.current);
+
+      // If a turnComplete timer is pending, reset it to allow more late-arriving
+      // inputTranscription messages (prevents tail truncation)
+      if (turnCompleteTimerRef.current) {
+        clearTimeout(turnCompleteTimerRef.current);
+        turnCompleteTimerRef.current = setTimeout(() => {
+          flushPendingUserText();
+          currentTurnRoleRef.current = null;
+          turnCompleteTimerRef.current = null;
+        }, 400);
+      }
     }
 
     // Handle model audio output
@@ -672,10 +742,18 @@ ${questionsContext}
 
     // Handle turn complete
     if (sc.turnComplete) {
-      // Flush all pending text in order: user first (if any left), then AI
-      flushPendingUserText();
+      // Flush AI text immediately (it's complete at this point)
       flushPendingAiText();
-      currentTurnRoleRef.current = null;
+
+      // Delay user text flush to allow late-arriving inputTranscription messages.
+      // The Gemini Live API sends inputTranscription asynchronously and the last
+      // few messages may still be in-flight when turnComplete arrives.
+      if (turnCompleteTimerRef.current) clearTimeout(turnCompleteTimerRef.current);
+      turnCompleteTimerRef.current = setTimeout(() => {
+        flushPendingUserText();
+        currentTurnRoleRef.current = null;
+        turnCompleteTimerRef.current = null;
+      }, 400);
 
       // Calculate the actual remaining playback time so we don't cut off audio
       const ctx = playbackContextRef.current;
@@ -725,10 +803,22 @@ ${questionsContext}
     const ctx = playbackContextRef.current;
     if (!ctx || audioQueueRef.current.length === 0) return;
 
+    // Schedule chunks up to ~1s ahead of current time for smooth gapless playback.
+    // This avoids the old approach of scheduling ALL queued chunks at once,
+    // which caused clock drift and audio stacking over long sessions.
+    const scheduleHorizon = ctx.currentTime + 1.0;
+
     while (audioQueueRef.current.length > 0) {
-      if (nextPlayTimeRef.current < ctx.currentTime) {
-        nextPlayTimeRef.current = ctx.currentTime + 0.05;
+      // Clock drift protection: if nextPlayTime has fallen behind currentTime
+      // by more than 200ms, snap forward to avoid overlap/stuttering
+      if (nextPlayTimeRef.current < ctx.currentTime - 0.2) {
+        nextPlayTimeRef.current = ctx.currentTime + 0.02;
+      } else if (nextPlayTimeRef.current < ctx.currentTime) {
+        nextPlayTimeRef.current = ctx.currentTime + 0.02;
       }
+
+      // Don't schedule too far ahead — leave remaining chunks for later
+      if (nextPlayTimeRef.current > scheduleHorizon) break;
 
       const chunk = audioQueueRef.current.shift()!;
       const audioBuffer = ctx.createBuffer(1, chunk.length, 24000);
@@ -739,7 +829,21 @@ ${questionsContext}
       source.connect(ctx.destination);
       source.start(nextPlayTimeRef.current);
 
+      // Track active source for cleanup on interruption
+      activeSourcesRef.current.add(source);
+      source.onended = () => {
+        source.disconnect();
+        activeSourcesRef.current.delete(source);
+      };
+
       nextPlayTimeRef.current += audioBuffer.duration;
+    }
+
+    // If there are still chunks waiting, schedule a timer to process them
+    // when we get closer to their play time
+    if (audioQueueRef.current.length > 0) {
+      const delay = Math.max(50, (nextPlayTimeRef.current - ctx.currentTime - 0.5) * 1000);
+      setTimeout(() => scheduleNextAudio(), delay);
     }
   };
 
@@ -875,9 +979,8 @@ ${questionsContext}
           animate={{ opacity: 1, y: 0 }}
           exit={{ opacity: 0, y: -10 }}
           transition={{ duration: 0.3, ease: 'easeOut' }}
-          className={`px-6 py-3 border-b border-white/5 flex items-center justify-center gap-3 ${
-            isMuted ? 'bg-zinc-500/10' : currentStatus.bgColor
-          }`}
+          className={`px-6 py-3 border-b border-white/5 flex items-center justify-center gap-3 ${isMuted ? 'bg-zinc-500/10' : currentStatus.bgColor
+            }`}
         >
           {/* Pulse indicator */}
           <div className="relative flex items-center">
@@ -887,13 +990,11 @@ ${questionsContext}
                 opacity: [0.6, 0, 0.6],
               }}
               transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
-              className={`absolute w-3 h-3 rounded-full ${
-                isMuted ? 'bg-zinc-500' : currentStatus.pulseColor
-              } opacity-30`}
+              className={`absolute w-3 h-3 rounded-full ${isMuted ? 'bg-zinc-500' : currentStatus.pulseColor
+                } opacity-30`}
             />
-            <div className={`w-2 h-2 rounded-full ${
-              isMuted ? 'bg-zinc-500' : currentStatus.pulseColor
-            } relative z-10`} />
+            <div className={`w-2 h-2 rounded-full ${isMuted ? 'bg-zinc-500' : currentStatus.pulseColor
+              } relative z-10`} />
           </div>
 
           {isMuted ? (
@@ -985,8 +1086,8 @@ ${questionsContext}
       {/* Main Content */}
       <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
 
-        {/* Left: Atmospheric Visualizer */}
-        <div className="w-full md:w-1/2 relative flex items-center justify-center border-r border-white/10 p-12">
+        {/* Left: Atmospheric Visualizer — fixed height, never scrolls */}
+        <div className="w-full md:w-1/2 relative flex items-center justify-center border-r border-white/10 p-12 shrink-0 h-[40vh] md:h-auto overflow-hidden">
           {/* Ethereal background glows */}
           <div className="absolute inset-0 overflow-hidden pointer-events-none">
             <motion.div
@@ -996,9 +1097,9 @@ ${questionsContext}
               }}
               transition={{ duration: aiStatus === 'speaking' ? 1.5 : 3, repeat: Infinity, ease: "easeInOut" }}
               className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] rounded-full blur-[100px] ${aiStatus === 'speaking' ? 'bg-blue-500/30' :
-                  aiStatus === 'thinking' ? 'bg-purple-500/20' :
-                    aiStatus === 'listening' ? 'bg-green-500/15' :
-                      'bg-orange-500/15'
+                aiStatus === 'thinking' ? 'bg-purple-500/20' :
+                  aiStatus === 'listening' ? 'bg-green-500/15' :
+                    'bg-orange-500/15'
                 }`}
             />
             {/* Secondary glow */}
@@ -1038,12 +1139,12 @@ ${questionsContext}
                 repeat: aiStatus === 'speaking' ? Infinity : 0,
               }}
               className={`w-36 h-36 mx-auto rounded-full flex items-center justify-center backdrop-blur-xl border-2 transition-colors duration-500 ${aiStatus === 'speaking'
-                  ? 'bg-blue-500/10 border-blue-400/50'
-                  : aiStatus === 'thinking'
-                    ? 'bg-purple-500/10 border-purple-400/50'
-                    : !isMuted
-                      ? 'bg-white/10 border-orange-500/40'
-                      : 'bg-white/5 border-white/10'
+                ? 'bg-blue-500/10 border-blue-400/50'
+                : aiStatus === 'thinking'
+                  ? 'bg-purple-500/10 border-purple-400/50'
+                  : !isMuted
+                    ? 'bg-white/10 border-orange-500/40'
+                    : 'bg-white/5 border-white/10'
                 }`}
             >
               {aiStatus === 'connecting' ? (
@@ -1099,33 +1200,32 @@ ${questionsContext}
 
             <div className="mt-10 flex flex-col items-center gap-4">
               <div className="flex justify-center gap-4">
-              <motion.button
-                whileHover={{ scale: 1.05 }}
-                whileTap={{ scale: 0.95 }}
-                onClick={toggleMute}
-                disabled={!isConnected}
-                className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300 shadow-lg ${!isMuted
+                <motion.button
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={toggleMute}
+                  disabled={!isConnected}
+                  className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300 shadow-lg ${!isMuted
                     ? 'bg-gradient-to-br from-orange-500/20 to-orange-600/10 hover:from-orange-500/30 hover:to-orange-600/20 text-orange-400 border border-orange-500/30'
                     : 'bg-red-500/20 text-red-400 hover:bg-red-500/30 border border-red-500/30'
-                  } ${!isConnected ? 'opacity-50 cursor-not-allowed' : ''}`}
-                title={isMuted ? '取消静音' : '静音'}
-              >
-                {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
-              </motion.button>
+                    } ${!isConnected ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  title={isMuted ? '取消静音' : '静音'}
+                >
+                  {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+                </motion.button>
 
-              <motion.button
-                whileHover={{ scale: 1.05 }}
-                whileTap={{ scale: 0.95 }}
-                onClick={() => setShowMicTest(prev => !prev)}
-                className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300 shadow-lg border ${
-                  showMicTest
+                <motion.button
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={() => setShowMicTest(prev => !prev)}
+                  className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300 shadow-lg border ${showMicTest
                     ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/30'
                     : 'bg-white/5 text-zinc-400 border-white/10 hover:bg-white/10'
-                }`}
-                title="麦克风测试"
-              >
-                <Settings2 className="w-6 h-6" />
-              </motion.button>
+                    }`}
+                  title="麦克风测试"
+                >
+                  <Settings2 className="w-6 h-6" />
+                </motion.button>
               </div>
 
               {/* 我说完了 button — visible when listening and mic is active */}
@@ -1177,25 +1277,23 @@ ${questionsContext}
                           <Volume2 className="w-3 h-3" />
                           实时音量
                         </span>
-                        <span className={`text-[10px] font-bold uppercase tracking-wide ${
-                          micTestStatus === 'good' ? 'text-green-400' :
+                        <span className={`text-[10px] font-bold uppercase tracking-wide ${micTestStatus === 'good' ? 'text-green-400' :
                           micTestStatus === 'low' ? 'text-amber-400' :
-                          micTestStatus === 'silent' ? 'text-red-400' : 'text-zinc-500'
-                        }`}>
+                            micTestStatus === 'silent' ? 'text-red-400' : 'text-zinc-500'
+                          }`}>
                           {micTestStatus === 'good' ? '✓ 正常' :
-                           micTestStatus === 'low' ? '⚠ 音量偏低' :
-                           micTestStatus === 'silent' ? '✗ 未检测到声音' : '等待中...'}
+                            micTestStatus === 'low' ? '⚠ 音量偏低' :
+                              micTestStatus === 'silent' ? '✗ 未检测到声音' : '等待中...'}
                         </span>
                       </div>
 
                       {/* Volume bar */}
                       <div className="h-3 bg-black/40 rounded-full overflow-hidden border border-white/5">
                         <motion.div
-                          className={`h-full rounded-full ${
-                            micVolume > 30 ? 'bg-gradient-to-r from-green-500 to-green-400' :
+                          className={`h-full rounded-full ${micVolume > 30 ? 'bg-gradient-to-r from-green-500 to-green-400' :
                             micVolume > 5 ? 'bg-gradient-to-r from-amber-500 to-amber-400' :
-                            'bg-red-500/50'
-                          }`}
+                              'bg-red-500/50'
+                            }`}
                           animate={{ width: `${Math.min(100, (micVolume / 255) * 100)}%` }}
                           transition={{ duration: 0.05 }}
                         />
@@ -1220,8 +1318,8 @@ ${questionsContext}
           </div>
         </div>
 
-        {/* Right: Live Transcript */}
-        <div className="w-full md:w-1/2 bg-zinc-900/50 flex flex-col overflow-hidden">
+        {/* Right: Live Transcript — independent scroll, fixed height */}
+        <div className="w-full md:w-1/2 bg-zinc-900/50 flex flex-col overflow-hidden min-h-0 flex-1">
           <div className="px-8 pt-6 pb-4 flex items-center gap-2 text-zinc-400 font-mono text-xs uppercase tracking-widest border-b border-white/5">
             <MessageSquare className="w-4 h-4" />
             实时对话记录
@@ -1261,8 +1359,8 @@ ${questionsContext}
                   {msg.role === 'user' ? '👤 你' : '🤖 面试官'}
                 </span>
                 <div className={`p-4 rounded-2xl max-w-[90%] text-sm leading-relaxed ${msg.role === 'user'
-                    ? 'bg-gradient-to-br from-orange-500/15 to-orange-600/5 border border-orange-500/20 text-orange-50 rounded-tr-sm'
-                    : 'bg-gradient-to-br from-white/8 to-white/3 border border-white/10 text-zinc-300 rounded-tl-sm'
+                  ? 'bg-gradient-to-br from-orange-500/15 to-orange-600/5 border border-orange-500/20 text-orange-50 rounded-tr-sm'
+                  : 'bg-gradient-to-br from-white/8 to-white/3 border border-white/10 text-zinc-300 rounded-tl-sm'
                   }`}>
                   {msg.text}
                 </div>
@@ -1283,7 +1381,7 @@ ${questionsContext}
                   <span className="text-[10px] uppercase tracking-widest mb-1.5 font-semibold text-orange-400/50 flex items-center gap-1">
                     👤 你
                     <span className="inline-flex items-center gap-0.5 ml-1">
-                      {[0,1,2].map(i => (
+                      {[0, 1, 2].map(i => (
                         <motion.span
                           key={i}
                           animate={{ opacity: [0.3, 1, 0.3] }}
@@ -1314,7 +1412,7 @@ ${questionsContext}
                   <span className="text-[10px] uppercase tracking-widest mb-1.5 font-semibold text-blue-400/50 flex items-center gap-1">
                     🤖 面试官
                     <span className="inline-flex items-center gap-0.5 ml-1">
-                      {[0,1,2].map(i => (
+                      {[0, 1, 2].map(i => (
                         <motion.span
                           key={i}
                           animate={{ opacity: [0.3, 1, 0.3] }}
