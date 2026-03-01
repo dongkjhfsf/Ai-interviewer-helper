@@ -117,6 +117,13 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
   // Delayed flush timer for user transcription — prevents tail truncation
   const turnCompleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Session Resumption: 保存最新的恢复令牌，用于重连时恢复上下文
+  const sessionResumeHandleRef = useRef<string | null>(null);
+  // 标记是否为首次连接（区分首连/重连的初始消息）
+  const isFirstSessionRef = useRef(true);
+  // Ref for transcript to access latest value in async callbacks
+  const transcriptRef = useRef<{ role: 'user' | 'ai', text: string }[]>([]);
+
   // Accumulate partial transcription text
   // These accumulate across multiple messages within a single turn
   const pendingAiTextRef = useRef('');
@@ -132,6 +139,25 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
 
   const questions = data?.questions || [];
   const questionsContext = questions.map((q: any, i: number) => `${i + 1}. [${q.difficulty}] ${q.content}`).join('\n');
+
+  // Keep transcriptRef in sync so async callbacks can read the latest transcript
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+
+  // 构建对话摘要，用于在无法使用 session resumption 时恢复上下文
+  const buildTranscriptSummary = useCallback((): string => {
+    const currentTranscript = transcriptRef.current;
+    if (currentTranscript.length === 0) {
+      return '面试开始了，请自我介绍并提出第一个问题。';
+    }
+
+    const history = currentTranscript
+      .map(t => `${t.role === 'ai' ? '面试官' : '候选人'}: ${t.text}`)
+      .join('\n');
+
+    return `连接中断后重新连接。以下是之前的面试对话记录，请从中断的地方继续提问，不要重复已经问过的问题：\n\n${history}\n\n请根据以上记录，继续面试。如果候选人刚回答了一个问题，请评价该回答并提出下一个问题。`;
+  }, []);
 
   // Auto scroll transcript — also triggered by live bubble updates
   useEffect(() => {
@@ -417,7 +443,7 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
           sampleSize: 16,
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: false,
+          autoGainControl: true,
         }
       });
 
@@ -449,13 +475,24 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
       const processor = audioContextRef.current.createScriptProcessor(2048, 1, 1);
       workletNodeRef.current = processor;
 
-      // 3. Setup Gemini Live API
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey || apiKey === 'YOUR_GEMINI_API_KEY_HERE') {
-        throw new Error('API Key 未配置。请在 .env 文件中设置 GEMINI_API_KEY。');
+      // 3. Setup Gemini Live API — 使用真实 API Key（从后端获取）
+      let ephemeralToken: string;
+      try {
+        const tokenRes = await fetch('/api/providers/google/client-key');
+        if (!tokenRes.ok) {
+          const err = await tokenRes.json().catch(() => ({ error: '未知错误' }));
+          throw new Error(err.error || `HTTP ${tokenRes.status}`);
+        }
+        const tokenData = await tokenRes.json();
+        ephemeralToken = tokenData.apiKey;
+      } catch (tokenErr: any) {
+        throw new Error(`无法获取临时令牌: ${tokenErr.message}`);
       }
 
-      const ai = new GoogleGenAI({ apiKey: apiKey.trim() });
+      const ai = new GoogleGenAI({
+        apiKey: ephemeralToken,
+        httpOptions: { apiVersion: "v1alpha" } // 使用 v1alpha 以支持原生音频进阶功能(共情对话等)
+      });
 
       const systemInstruction = `
 你是一个非常严格、专业的技术面试官。你正在进行一场模拟面试。
@@ -485,7 +522,7 @@ ${questionsContext}
       `.trim();
 
       const session = await ai.live.connect({
-        model: "gemini-2.5-flash-native-audio-preview-09-2025",
+        model: "gemini-2.5-flash-native-audio-preview-12-2025",
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -494,6 +531,19 @@ ${questionsContext}
           systemInstruction: systemInstruction,
           inputAudioTranscription: {},
           outputAudioTranscription: {},
+          enableAffectiveDialog: true, // 开启共情对话：根据情感语气调整音频流输出风格
+          thinkingConfig: {
+            thinkingBudget: 1024,      // 明确思考开销，保证更好的逻辑表现
+          },
+          // 启用会话恢复：断线重连时自动保持上下文
+          sessionResumption: {
+            handle: sessionResumeHandleRef.current ?? undefined,
+          },
+          // 启用上下文窗口压缩：支持更长的面试会话
+          contextWindowCompression: {
+            slidingWindow: {},
+            triggerTokens: "80000",
+          },
           // VAD configuration: make the model wait longer before responding
           realtimeInputConfig: {
             automaticActivityDetection: {
@@ -604,16 +654,43 @@ ${questionsContext}
       processor.connect(silentMonitor);
       silentMonitor.connect(audioContextRef.current.destination);
 
-      // Send initial text to trigger AI greeting
+      // Send initial or resume message
       setTimeout(() => {
         if (runId !== sessionRunIdRef.current || sessionRef.current !== session) return;
         if (!isSessionOpenRef.current) return;
         if (sessionRef.current) {
           try {
-            session.sendClientContent({
-              turns: '面试开始了，请自我介绍并提出第一个问题。',
-              turnComplete: true,
-            });
+            if (isFirstSessionRef.current) {
+              // 首次连接：正常开始面试
+              session.sendClientContent({
+                turns: [{ role: 'user', parts: [{ text: '面试开始了，请自我介绍并提出第一个问题。' }] }],
+                turnComplete: true,
+              });
+              isFirstSessionRef.current = false;
+            } else if (sessionResumeHandleRef.current) {
+              // 有恢复令牌：Session Resumption 会自动恢复上下文
+              // 只需提示 AI 继续即可
+              console.log('[LiveAPI] Resuming session with handle');
+              session.sendClientContent({
+                turns: [{ role: 'user', parts: [{ text: '连接已恢复，请继续。' }] }],
+                turnComplete: true,
+              });
+            } else {
+              // 重连但没有恢复令牌（令牌过期等）：发送结构化的对话历史
+              console.log('[LiveAPI] No resume handle, sending structured transcript as fallback');
+              const currentTranscript = transcriptRef.current;
+              if (currentTranscript.length > 0) {
+                const historyTurns = currentTranscript.map(t => ({
+                  role: t.role === 'ai' ? 'model' : 'user',
+                  parts: [{ text: t.text }],
+                }));
+                session.sendClientContent({ turns: historyTurns, turnComplete: false });
+              }
+              session.sendClientContent({
+                turns: [{ role: 'user', parts: [{ text: currentTranscript.length > 0 ? '连接中断后重新连接,请根据以上对话记录继续面试,不要重复已经问过的问题。' : '面试开始了,请自我介绍并提出第一个问题。' }] }],
+                turnComplete: true,
+              });
+            }
             setAiStatus('thinking');
           } catch (err) {
             console.error('[LiveAPI] Failed to send initial message:', err);
@@ -630,6 +707,22 @@ ${questionsContext}
   };
 
   const handleServerMessage = (message: LiveServerMessage) => {
+    // 捕获 session resumption 恢复令牌
+    if ((message as any).sessionResumptionUpdate) {
+      const update = (message as any).sessionResumptionUpdate;
+      if (update.resumable && update.newHandle) {
+        sessionResumeHandleRef.current = update.newHandle;
+        console.log('[LiveAPI] Session resumption token updated');
+      }
+    }
+
+    // 处理 GoAway 消息：服务器即将断开连接，主动重连以避免被动中断
+    if ((message as any).goAway) {
+      console.log('[LiveAPI] GoAway received — server will disconnect soon, proactively reconnecting...');
+      scheduleReconnect('服务器通知即将断开');
+      return;
+    }
+
     const sc = message.serverContent;
     if (!sc) return;
 
@@ -909,7 +1002,7 @@ ${questionsContext}
   const currentStatus = STATUS_CONFIG[aiStatus];
 
   return (
-    <div className="min-h-screen bg-[#050505] text-white overflow-hidden flex flex-col">
+    <div className="h-screen bg-[#050505] text-white overflow-hidden flex flex-col">
       {/* Header */}
       <header className="px-6 py-4 flex justify-between items-center border-b border-white/10">
         <div className="flex items-center gap-4">

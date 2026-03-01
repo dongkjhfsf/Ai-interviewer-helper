@@ -38,6 +38,21 @@ function getErrorDetail(error: any): string {
 
 function isTransientGoogleConnectionError(error: any): boolean {
   const detail = getErrorDetail(error).toLowerCase();
+  const transientStatusCodes = [
+    "http 408",
+    "http 409",
+    "http 425",
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "http 520",
+    "http 521",
+    "http 522",
+    "http 523",
+    "http 524",
+  ];
   return (
     detail.includes("fetch failed") ||
     detail.includes("apiconnectionerror") ||
@@ -45,18 +60,28 @@ function isTransientGoogleConnectionError(error: any): boolean {
     detail.includes("connecttimeout") ||
     detail.includes("timed out") ||
     detail.includes("econnreset") ||
-    detail.includes("enotfound")
+    detail.includes("enotfound") ||
+    detail.includes("gateway") ||
+    detail.includes("temporarily unavailable") ||
+    detail.includes("resource exhausted") ||
+    detail.includes("aborted") ||
+    detail.includes("aborterror") ||
+    transientStatusCodes.some((code) => detail.includes(code))
   );
 }
 
 function toClientSafeErrorMessage(error: any, providerName = "AI"): string {
   const detail = getErrorDetail(error);
-  if (detail.toLowerCase().includes("fetch failed") || detail.toLowerCase().includes("econnreset") || detail.toLowerCase().includes("timed out") || detail.toLowerCase().includes("aborted")) {
-    return `${providerName} 请求失败（网络/网关问题）。请重试或切换其他模型。`;
+  if (isTransientGoogleConnectionError(error) || detail.toLowerCase().includes("aborted")) {
+    return `${providerName} 网络/连接异常，请稍后重试。`;
   }
   // Strip internal stack traces, keep the human-readable part
   const msg = error?.message || "Failed to generate questions";
   return msg.length > 300 ? msg.slice(0, 300) + "..." : msg;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const JSON_INSTRUCTION = `\n\nYou MUST respond with ONLY a valid JSON object (no markdown fences, no extra text). The JSON structure must be:
@@ -206,6 +231,92 @@ ${contextCard}
 `);
 }
 
+// ============================================================
+// Prescribed (指定题目) mode helpers
+// ============================================================
+
+/**
+ * Detect whether the input looks like a question list.
+ * Heuristics:
+ *  - Has at least 3 non-empty lines
+ *  - At least half of them end with '？' or '?' OR start with a list marker
+ *    (- , · , \u25cf , number. , Q\d+) OR contain '区别' / '是什么' / '如何' / '什么是'
+ */
+function detectQuestionList(text: string): boolean {
+  if (!text || !text.trim()) return false;
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (lines.length < 3) return false;
+
+  const listMarker = /^(-|·|•|\d+\.|Q\d+)/i;
+  const questionEnd = /[？?]$/;
+  const questionKeyword = /区别|是什么|如何|什么是|怎么|有哪些|原因|概念|定义|机制/;
+
+  let matchCount = 0;
+  for (const line of lines) {
+    if (listMarker.test(line) || questionEnd.test(line) || questionKeyword.test(line)) {
+      matchCount++;
+    }
+  }
+  return matchCount / lines.length >= 0.4;
+}
+
+/**
+ * Extract individual question strings from the user's text.
+ * Strips leading list markers and trailing source annotations like (Q3) [Source 6].
+ */
+function parseQuestionList(text: string): string[] {
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  const results: string[] = [];
+  for (const line of lines) {
+    // Strip leading list markers: "- ", "· ", "• ", "1. ", "Q3. ", etc.
+    let q = line
+      .replace(/^(-|·|•|\d+\.|Q\d+[.:]?)/i, "")
+      .trim();
+    // Strip trailing source annotations: (Q3) [Source 6] etc.
+    q = q.replace(/\s*(\(Q\d+[^)]*\))?\s*(\[Source\s*\d+\])?\s*$/i, "").trim();
+    // Also strip trailing note lines like "\t注：..."
+    q = q.replace(/^注[：:].*$/, "").trim();
+    if (q.length > 4) {
+      results.push(q);
+    }
+  }
+  // Deduplicate while preserving order
+  return [...new Set(results)];
+}
+
+/**
+ * Build a user prompt that instructs the model to generate answers
+ * STRICTLY for the provided question list (no extra free-form questions).
+ */
+function buildPrescribedUserPrompt(
+  prescribedQuestions: string[],
+  moduleId: string
+): string {
+  const questionList = prescribedQuestions
+    .map((q, i) => `${i + 1}. ${q}`)
+    .join("\n");
+
+  return compactText(`
+TASK: Generate interview answers for the EXACT question list below. Do NOT add, remove, or reorder any questions.
+MODULE: ${moduleId}
+OUTPUT: JSON object only; title(3-8 Chinese chars describing the topic) + questions array.
+  Each element must use the EXACT question text from the list as "content".
+  Assign difficulty (Easy|Medium|Hard) and category based on the question topic.
+  Provide a high-quality, well-structured Markdown answer in "answer".
+LANG: Simplified Chinese for all answers (content keeps original Chinese wording).
+
+PRESCRIBED_QUESTION_LIST (${prescribedQuestions.length} questions — follow exactly, in order):
+${questionList}
+`);
+}
+
 async function generateWithGoogle(
   apiKey: string,
   model: string,
@@ -252,6 +363,33 @@ async function generateWithGoogle(
   } catch (error: any) {
     throw new Error(`Google model ${model} request failed: ${getErrorDetail(error)}`);
   }
+}
+
+
+async function generateWithGoogleWithRetry(
+  apiKey: string,
+  model: string,
+  systemPrompt: string,
+  userPrompt: string,
+  maxAttempts = 3
+): Promise<GenerationResult> {
+  let lastError: any;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await generateWithGoogle(apiKey, model, systemPrompt, userPrompt);
+    } catch (error: any) {
+      lastError = error;
+      if (!isTransientGoogleConnectionError(error) || attempt === maxAttempts) {
+        throw error;
+      }
+      const backoffMs = Math.min(4_000, 600 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 250);
+      console.warn(
+        `Google model ${model} transient error (attempt ${attempt}/${maxAttempts}), retrying in ${backoffMs}ms: ${getErrorDetail(error)}`
+      );
+      await wait(backoffMs);
+    }
+  }
+  throw lastError;
 }
 
 async function generateWithOpenAICompatible(
@@ -359,7 +497,7 @@ async function generateQuestions(
 ): Promise<GenerationResult> {
   switch (providerId) {
     case "google":
-      return generateWithGoogle(apiKey, model, systemPrompt, userPrompt);
+      return generateWithGoogleWithRetry(apiKey, model, systemPrompt, userPrompt);
     case "openai":
       return generateWithOpenAICompatible(apiKey, model, systemPrompt, userPrompt, "https://api.openai.com/v1");
     case "deepseek":
@@ -409,6 +547,46 @@ async function startServer() {
   // API Routes
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
+  });
+
+  // ============================================================
+  // Ephemeral Token for Live API (keeps API key on server side)
+  // ============================================================
+  app.get("/api/live-token", async (req, res) => {
+    try {
+      const apiKey = resolveApiKey("google");
+      if (!apiKey) {
+        return res.status(500).json({ error: "Google API Key 未配置" });
+      }
+
+      const expireTime = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+      const newSessionExpireTime = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1alpha/authTokens?key=${apiKey.trim()}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            uses: 1,
+            expireTime,
+            newSessionExpireTime,
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        console.error("[live-token] Failed to create ephemeral token:", response.status, errorBody);
+        return res.status(502).json({ error: "无法创建临时令牌", details: errorBody });
+      }
+
+      const tokenData = await response.json();
+      res.json({ token: tokenData.name });
+    } catch (error: any) {
+      console.error("[live-token] Error:", error);
+      res.status(500).json({ error: "创建临时令牌失败: " + error.message, stack: error.stack });
+    }
   });
 
   app.get("/api/questions/history", (req, res) => {
@@ -639,6 +817,62 @@ async function startServer() {
     } catch (error) {
       console.error("Error creating category:", error);
       res.status(500).json({ error: "Failed to create category" });
+    }
+  });
+
+  // Move a category to a new parent
+  app.put("/api/categories/:id/move", (req, res) => {
+    try {
+      const categoryId = Number(req.params.id);
+      const rawParentId = req.body?.parentId;
+      const parentId = rawParentId === null || rawParentId === undefined || rawParentId === ""
+        ? null
+        : Number(rawParentId);
+
+      if (!Number.isInteger(categoryId) || categoryId <= 0) {
+        return res.status(400).json({ error: "Invalid category id" });
+      }
+      if (parentId !== null && (!Number.isInteger(parentId) || parentId <= 0)) {
+        return res.status(400).json({ error: "Invalid parentId" });
+      }
+      if (parentId === categoryId) {
+        return res.status(400).json({ error: "Category cannot be its own parent" });
+      }
+
+      const category = db.prepare("SELECT id FROM batch_categories WHERE id = ?").get(categoryId) as any;
+      if (!category) {
+        return res.status(404).json({ error: "Category not found" });
+      }
+
+      if (parentId !== null) {
+        const parent = db.prepare("SELECT id, parent_id FROM batch_categories WHERE id = ?").get(parentId) as any;
+        if (!parent) {
+          return res.status(404).json({ error: "Target parent category not found" });
+        }
+
+        // Prevent moving a category under its own descendant.
+        const getParentStmt = db.prepare("SELECT parent_id FROM batch_categories WHERE id = ?");
+        let cursor: number | null = parentId;
+        while (cursor !== null) {
+          if (cursor === categoryId) {
+            return res.status(400).json({ error: "Cannot move category under its own descendant" });
+          }
+          const row = getParentStmt.get(cursor) as any;
+          cursor = row?.parent_id ?? null;
+        }
+      }
+
+      const maxOrder = db.prepare(
+        `SELECT COALESCE(MAX(sort_order), -1) as max_order FROM batch_categories WHERE parent_id IS ?`
+      ).get(parentId) as any;
+
+      db.prepare("UPDATE batch_categories SET parent_id = ?, sort_order = ? WHERE id = ?")
+        .run(parentId, (maxOrder?.max_order ?? -1) + 1, categoryId);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error moving category:", error);
+      res.status(500).json({ error: "Failed to move category" });
     }
   });
 
@@ -1097,17 +1331,44 @@ async function startServer() {
         contextText += `\n\nUser Provided Text Context:\n${textContext}`;
       }
 
-      // Fetch existing questions to avoid repetition
-      const existingQuestions = db.prepare('SELECT content FROM questions WHERE module_id = ?').all(moduleId) as { content: string }[];
-      // User requirement: keep ALL historical questions, include question text only (no answers)
-      const existingQuestionsText = existingQuestions.map((q, idx) => `${idx + 1}. ${compactText(q.content)}`).join('\n');
+      // Detect prescribed (指定题目) mode: if the raw textContext looks like a question list,
+      // use a strict prompt that forces the model to answer each question verbatim.
+      const isPrescribed = !!textContext && detectQuestionList(textContext);
+      let prescribedQuestions: string[] = [];
+      let systemPrompt: string;
+      let userPrompt: string;
 
-      const systemPrompt = getSystemPromptForModule(moduleId);
-      const contextCard = buildContextCard(contextText);
-      const userPrompt = buildUserPrompt(moduleId, contextCard, existingQuestionsText);
+      if (isPrescribed) {
+        prescribedQuestions = parseQuestionList(textContext);
+        console.log(`[prescribed mode] Detected ${prescribedQuestions.length} questions from user input.`);
+        // In prescribed mode use the knowledge system prompt (principle-focused)
+        systemPrompt = getSystemPromptForModule(moduleId);
+        userPrompt = buildPrescribedUserPrompt(prescribedQuestions, moduleId);
+      } else {
+        // Fetch existing questions to avoid repetition
+        const existingQuestions = db.prepare('SELECT content FROM questions WHERE module_id = ? ORDER BY id DESC').all(moduleId) as { content: string }[];
+        // Limit history to avoid overly large prompts (max ~4000 chars)
+        const HISTORY_CHAR_LIMIT = 4000;
+        let historyChars = 0;
+        const cappedQuestions: { content: string }[] = [];
+        for (const q of existingQuestions) {
+          const line = compactText(q.content);
+          if (historyChars + line.length > HISTORY_CHAR_LIMIT) break;
+          cappedQuestions.push(q);
+          historyChars += line.length + 4; // +4 for index prefix
+        }
+        const existingQuestionsText = cappedQuestions.map((q, idx) => {
+          const short = compactText(q.content).slice(0, 45);
+          return `${idx + 1}. ${short}`;
+        }).join('\n');
+        systemPrompt = getSystemPromptForModule(moduleId);
+        contextText += "";
+        const contextCard = buildContextCard(contextText);
+        userPrompt = buildUserPrompt(moduleId, contextCard, existingQuestionsText);
+      }
 
       console.log(
-        `Prompt length: system=${systemPrompt.length}, user=${userPrompt.length}, contextCard=${contextCard.length}, history=${existingQuestionsText.length} chars`
+        `[mode=${isPrescribed ? 'prescribed' : 'free'}] Prompt length: system=${systemPrompt.length}, user=${userPrompt.length}`
       );
 
       // Dispatch to the appropriate provider
@@ -1117,36 +1378,24 @@ async function startServer() {
       try {
         responseData = await generateQuestions(providerId, apiKey, modelToUse, systemPrompt, userPrompt);
       } catch (error: any) {
-        // Gemini 2.5 Flash occasionally hits transient network/gateway issues.
-        // Retry once with the same model before falling back to Flash Lite.
+        // Gemini fallback path: after provider-level retries fail, try Flash Lite once.
         if (
           providerId === "google" &&
           modelToUse === "gemini-2.5-flash" &&
           isTransientGoogleConnectionError(error)
         ) {
+          const fallbackModel = "gemini-2.5-flash-lite";
           console.warn(
-            `Primary model failed (attempt 1), retrying same model: ${modelToUse}. Reason: ${getErrorDetail(error)}`
+            `Primary model failed after retries, falling back: ${modelToUse} -> ${fallbackModel}. Reason: ${getErrorDetail(error)}`
           );
-          try {
-            responseData = await generateQuestions(providerId, apiKey, modelToUse, systemPrompt, userPrompt);
-          } catch (retryError: any) {
-            // Retry also failed — now fall back to Flash Lite
-            if (isTransientGoogleConnectionError(retryError)) {
-              const fallbackModel = "gemini-2.5-flash-lite";
-              console.warn(
-                `Retry also failed, falling back: ${modelToUse} -> ${fallbackModel}. Reason: ${getErrorDetail(retryError)}`
-              );
-              responseData = await generateQuestions(providerId, apiKey, fallbackModel, systemPrompt, userPrompt);
-              fallbackFromModel = modelToUse;
-              actualModelUsed = fallbackModel;
-            } else {
-              throw retryError;
-            }
-          }
+          responseData = await generateQuestions(providerId, apiKey, fallbackModel, systemPrompt, userPrompt);
+          fallbackFromModel = modelToUse;
+          actualModelUsed = fallbackModel;
         } else {
           throw error;
         }
       }
+
       const { title, questions } = responseData;
 
       // Save to Database

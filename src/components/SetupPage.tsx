@@ -39,6 +39,21 @@ export default function SetupPage({
   const [activeModel, setActiveModel] = useState<{ modelId: string; providerId: string; modelName: string } | null>(null);
   const { githubUrl, textContext, file } = persistedInputs;
 
+  // Detect if the user's text context looks like a question list
+  const isPrescribedMode = (() => {
+    if (!textContext || !textContext.trim()) return false;
+    const lines = textContext.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    if (lines.length < 3) return false;
+    const listMarker = /^(-|·|•|\d+\.|Q\d+)/i;
+    const questionEnd = /[？?]$/;
+    const questionKeyword = /区别|是什么|如何|什么是|怎么|有哪些|原因|概念|定义|机制/;
+    let matchCount = 0;
+    for (const line of lines) {
+      if (listMarker.test(line) || questionEnd.test(line) || questionKeyword.test(line)) matchCount++;
+    }
+    return matchCount / lines.length >= 0.4;
+  })();
+
   // Fetch configured providers indicator
   const fetchProviderStatus = async () => {
     try {
@@ -385,11 +400,21 @@ export default function SetupPage({
               {/* Text Context Input */}
               <div className="relative">
                 <textarea
-                  placeholder="Paste job description, specific topics, or any other context here..."
+                  placeholder="粘贴题目清单（每行一道题，AI 将严格按题生成答案）；或粘贴 JD、技术主题等背景资料供 AI 自由出题。"
                   value={textContext}
                   onChange={(e) => onPersistedInputsChange({ textContext: e.target.value })}
                   className="w-full p-4 rounded-2xl border border-zinc-100 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900/10 focus:border-zinc-300 transition-all min-h-[100px] resize-none"
                 />
+                {/* Prescribed mode indicator */}
+                {textContext && textContext.trim() && (
+                  <div className={`mt-1.5 inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full w-fit ${isPrescribedMode
+                      ? 'text-orange-700 bg-orange-100'
+                      : 'text-green-700 bg-green-100'
+                    }`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${isPrescribedMode ? 'bg-orange-500' : 'bg-green-500'}`} />
+                    {isPrescribedMode ? '精确模式' : '自由模式'}
+                  </div>
+                )}
               </div>
             </div>
           </motion.div>

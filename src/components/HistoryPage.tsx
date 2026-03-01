@@ -57,6 +57,7 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
   const [editingCategoryId, setEditingCategoryId] = useState<number | null>(null);
   const [editingCategoryName, setEditingCategoryName] = useState('');
   const [dragOverCategoryId, setDragOverCategoryId] = useState<number | null>(null);
+  const [dragOverMoveCategoryId, setDragOverMoveCategoryId] = useState<number | null>(null);
   const [showNewCategoryInput, setShowNewCategoryInput] = useState(false);
 
   // Batch rename state
@@ -65,8 +66,10 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
 
   // Track dragging origin for better UX and unassigning
   const [draggingBatchId, setDraggingBatchId] = useState<number | string | null>(null);
+  const [draggingCategoryId, setDraggingCategoryId] = useState<number | null>(null);
   const [dragSourceCategoryId, setDragSourceCategoryId] = useState<number | null>(null);
   const [isDragOverLeftColumn, setIsDragOverLeftColumn] = useState(false);
+  const [isDragOverRightColumnRoot, setIsDragOverRightColumnRoot] = useState(false);
 
   const fetchHistory = () => {
     setIsLoading(true);
@@ -207,6 +210,24 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
     }
   };
 
+  const moveCategory = async (categoryId: number, parentId: number | null) => {
+    try {
+      const res = await fetch(`/api/categories/${categoryId}/move`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentId }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to move category');
+      }
+      fetchCategories();
+    } catch (err: any) {
+      console.error('Failed to move category', err);
+      alert(err?.message || 'Failed to move category');
+    }
+  };
+
   const toggleCategory = (id: number) => {
     setExpandedCategories(prev => {
       const next = new Set(prev);
@@ -214,6 +235,25 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
       else next.add(id);
       return next;
     });
+  };
+
+  const getDragPayload = (e: React.DragEvent): any | null => {
+    try {
+      const raw = e.dataTransfer.getData('application/json');
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  };
+
+  const isDescendantCategory = (categoryId: number, potentialAncestorId: number): boolean => {
+    let current = categories.find(c => c.id === categoryId) || null;
+    while (current?.parent_id !== null) {
+      if (current.parent_id === potentialAncestorId) return true;
+      current = categories.find(c => c.id === current?.parent_id) || null;
+    }
+    return false;
   };
 
   // Batch renaming
@@ -240,6 +280,7 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
     e.dataTransfer.setData('application/json', JSON.stringify({ batchId: batch.id, type: 'batch', sourceCategoryId }));
     e.dataTransfer.effectAllowed = 'copyMove';
     setDraggingBatchId(batch.id);
+    setDraggingCategoryId(null);
     setDragSourceCategoryId(sourceCategoryId);
 
     // Slight delay to allow the native drag image to capture the full element before changing styling
@@ -251,46 +292,110 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
 
   const handleDragEnd = (e: React.DragEvent) => {
     setDraggingBatchId(null);
+    setDraggingCategoryId(null);
     setDragSourceCategoryId(null);
     setIsDragOverLeftColumn(false);
+    setIsDragOverRightColumnRoot(false);
+    setDragOverCategoryId(null);
+    setDragOverMoveCategoryId(null);
     const el = e.target as HTMLElement;
     if (el) el.style.opacity = '1';
   };
 
-  const handleDragOver = (e: React.DragEvent, categoryId: number | 'left') => {
+  const handleCategoryDragStart = (e: React.DragEvent, category: Category) => {
+    e.dataTransfer.setData(
+      'application/json',
+      JSON.stringify({ type: 'category', categoryId: category.id, sourceParentId: category.parent_id ?? null })
+    );
+    e.dataTransfer.effectAllowed = 'move';
+    setDraggingCategoryId(category.id);
+    setDraggingBatchId(null);
+    setDragSourceCategoryId(null);
+  };
+
+  const handleDragOver = (e: React.DragEvent, categoryId: number | 'left' | 'right-root') => {
     e.preventDefault();
+    const payload = getDragPayload(e);
+
     if (categoryId === 'left') {
+      if (payload?.type !== 'batch') {
+        setIsDragOverLeftColumn(false);
+        return;
+      }
       e.dataTransfer.dropEffect = 'move';
       setIsDragOverLeftColumn(true);
       setDragOverCategoryId(null);
+      setDragOverMoveCategoryId(null);
+      setIsDragOverRightColumnRoot(false);
+      return;
+    }
+
+    if (categoryId === 'right-root') {
+      if (payload?.type !== 'category') {
+        setIsDragOverRightColumnRoot(false);
+        return;
+      }
+      e.dataTransfer.dropEffect = 'move';
+      setIsDragOverRightColumnRoot(true);
+      setDragOverCategoryId(null);
+      setDragOverMoveCategoryId(null);
+      setIsDragOverLeftColumn(false);
+      return;
+    }
+
+    if (payload?.type === 'category') {
+      const draggedCategoryId = Number(payload.categoryId);
+      if (
+        Number.isInteger(draggedCategoryId) &&
+        draggedCategoryId !== categoryId &&
+        !isDescendantCategory(categoryId, draggedCategoryId)
+      ) {
+        e.dataTransfer.dropEffect = 'move';
+        setDragOverMoveCategoryId(categoryId);
+      } else {
+        e.dataTransfer.dropEffect = 'none';
+        setDragOverMoveCategoryId(null);
+      }
+      setDragOverCategoryId(null);
+      setIsDragOverLeftColumn(false);
+      setIsDragOverRightColumnRoot(false);
     } else {
       e.dataTransfer.dropEffect = 'copy';
       setDragOverCategoryId(categoryId);
+      setDragOverMoveCategoryId(null);
       setIsDragOverLeftColumn(false);
+      setIsDragOverRightColumnRoot(false);
     }
   };
 
-  const handleDragLeave = (e: React.DragEvent, target: 'left' | 'cat') => {
+  const handleDragLeave = (e: React.DragEvent, target: 'left' | 'cat' | 'right-root') => {
     if (target === 'left') {
       setIsDragOverLeftColumn(false);
+    } else if (target === 'right-root') {
+      setIsDragOverRightColumnRoot(false);
     } else {
       setDragOverCategoryId(null);
+      setDragOverMoveCategoryId(null);
     }
   };
 
-  const handleDrop = async (e: React.DragEvent, targetId: number | 'left') => {
+  const handleDrop = async (e: React.DragEvent, targetId: number | 'left' | 'right-root') => {
     e.preventDefault();
     setDragOverCategoryId(null);
+    setDragOverMoveCategoryId(null);
     setIsDragOverLeftColumn(false);
+    setIsDragOverRightColumnRoot(false);
     try {
-      const data = JSON.parse(e.dataTransfer.getData('application/json'));
+      const data = getDragPayload(e);
+      if (!data) return;
+
       if (data.type === 'batch' && data.batchId) {
         if (targetId === 'left') {
           // Unassign from its category
           if (data.sourceCategoryId) {
             await removeBatchFromCategory(data.batchId, data.sourceCategoryId);
           }
-        } else {
+        } else if (typeof targetId === 'number') {
           // Assign to new category
           if (data.sourceCategoryId && data.sourceCategoryId !== targetId) {
             // Optional: if moving within categories, we don't have a 1-to-1 strict tree (it's many-to-many in DB),
@@ -298,6 +403,18 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
             await removeBatchFromCategory(data.batchId, data.sourceCategoryId);
           }
           await assignBatchToCategory(data.batchId, targetId);
+        }
+      } else if (data.type === 'category' && data.categoryId) {
+        const draggedCategoryId = Number(data.categoryId);
+        if (!Number.isInteger(draggedCategoryId)) return;
+
+        if (targetId === 'right-root') {
+          await moveCategory(draggedCategoryId, null);
+        } else if (typeof targetId === 'number') {
+          if (draggedCategoryId === targetId) return;
+          if (isDescendantCategory(targetId, draggedCategoryId)) return;
+          await moveCategory(draggedCategoryId, targetId);
+          setExpandedCategories(prev => new Set([...prev, targetId]));
         }
       }
     } catch (err) {
@@ -332,22 +449,41 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
     const children = getChildCategories(cat.id);
     const categoryBatches = getBatchesForCategory(cat.id);
     const isEditing = editingCategoryId === cat.id;
-    const isDragOver = dragOverCategoryId === cat.id;
+    const isBatchDragOver = dragOverCategoryId === cat.id;
+    const isCategoryMoveTarget = dragOverMoveCategoryId === cat.id;
+    const isCategoryBeingDragged = draggingCategoryId === cat.id;
     const isAddingSub = addingSubcategoryFor === cat.id;
 
     return (
       <div key={cat.id} className="select-none">
         <div
-          className={`flex items-center gap-2 px-3 py-2.5 rounded-xl cursor-pointer transition-all group/cat ${isDragOver
-            ? 'bg-orange-100 border-2 border-dashed border-orange-400 shadow-inner'
-            : 'hover:bg-zinc-100 border-2 border-transparent'
+          draggable={!isEditing}
+          onDragStart={(e) => !isEditing && handleCategoryDragStart(e, cat)}
+          onDragEnd={handleDragEnd}
+          className={`flex items-center gap-2 px-3 py-2.5 rounded-xl transition-all group/cat ${isCategoryBeingDragged ? 'opacity-40' : ''
+            } ${isCategoryMoveTarget
+              ? 'bg-blue-50 border-2 border-dashed border-blue-400 shadow-inner'
+              : isBatchDragOver
+                ? 'bg-orange-100 border-2 border-dashed border-orange-400 shadow-inner'
+                : 'hover:bg-zinc-100 border-2 border-transparent'
+            } ${isEditing ? 'cursor-text' : 'cursor-grab active:cursor-grabbing'
             }`}
           style={{ paddingLeft: `${12 + depth * 20}px` }}
-          onDragOver={(e) => handleDragOver(e, cat.id)}
-          onDragLeave={(e) => handleDragLeave(e, 'cat')}
-          onDrop={(e) => handleDrop(e, cat.id)}
+          onDragOver={(e) => {
+            e.stopPropagation();
+            handleDragOver(e, cat.id);
+          }}
+          onDragLeave={(e) => {
+            e.stopPropagation();
+            handleDragLeave(e, 'cat');
+          }}
+          onDrop={(e) => {
+            e.stopPropagation();
+            handleDrop(e, cat.id);
+          }}
           onClick={() => !isEditing && toggleCategory(cat.id)}
         >
+          {!isEditing && <GripVertical className="w-3.5 h-3.5 text-zinc-300 flex-shrink-0" />}
           <button
             className="p-0.5 text-zinc-400 hover:text-zinc-600 transition-colors"
             onClick={(e) => { e.stopPropagation(); toggleCategory(cat.id); }}
@@ -596,7 +732,7 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
               {/* Empty state */}
               {categoryBatches.length === 0 && children.length === 0 && (
                 <div
-                  className={`text-xs text-zinc-400 py-3 text-center italic ${isDragOver ? 'text-orange-500' : ''
+                  className={`text-xs text-zinc-400 py-3 text-center italic ${isBatchDragOver ? 'text-orange-500' : ''
                     }`}
                   style={{ paddingLeft: `${32 + depth * 20}px` }}
                 >
@@ -644,7 +780,7 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
             No question sets generated yet.
           </div>
         ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-[3fr_7fr] gap-6">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* Left Column: All Question Sets */}
             <div
               className={`rounded-3xl border-2 transition-all p-2 -mx-2 -mt-2 ${isDragOverLeftColumn ? 'border-dashed border-orange-400 bg-orange-50/50' : 'border-transparent'
@@ -738,7 +874,7 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
                           </div>
 
                           {!isBatchEditing && (
-                            <div className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity ml-2 gap-1.5">
+                            <div className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity ml-2 gap-1.5 shrink-0">
                               {onReuseBatch && (
                                 <button
                                   onClick={(e) => {
@@ -779,7 +915,7 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
                             }
                             setDeletingId(id);
                           }}
-                          className="px-4 border-l border-zinc-50 hover:bg-red-50 text-zinc-300 hover:text-red-500 transition-colors group/del"
+                          className="px-4 border-l border-zinc-50 hover:bg-red-50 text-zinc-300 hover:text-red-500 transition-colors group/del shrink-0"
                           title="永久删除"
                         >
                           <Trash2 className="w-4 h-4 group-hover/del:scale-110 transition-transform" />
@@ -796,8 +932,21 @@ export default function HistoryPage({ onBack, onReuseBatch }: { onBack: () => vo
                 <FolderOpen className="w-4 h-4 text-orange-500" />
                 <h2 className="text-sm font-semibold text-zinc-500 uppercase tracking-wider">我的分类</h2>
               </div>
-              <div className="bg-white rounded-2xl shadow-sm border border-zinc-100 overflow-hidden">
+              <div
+                className={`bg-white rounded-2xl shadow-sm border overflow-hidden transition-colors ${isDragOverRightColumnRoot
+                  ? 'border-2 border-dashed border-blue-400 bg-blue-50/40'
+                  : 'border-zinc-100'
+                  }`}
+                onDragOver={(e) => handleDragOver(e, 'right-root')}
+                onDragLeave={(e) => handleDragLeave(e, 'right-root')}
+                onDrop={(e) => handleDrop(e, 'right-root')}
+              >
                 <div className="p-4">
+                  {isDragOverRightColumnRoot && (
+                    <div className="mb-3 rounded-xl border border-dashed border-blue-300 bg-blue-50 px-3 py-2 text-xs text-blue-600">
+                      释放到这里可移动到根目录
+                    </div>
+                  )}
                   {/* Category tree */}
                   {topLevelCategories.length > 0 ? (
                     <div className="space-y-0.5">
@@ -954,11 +1103,16 @@ function BatchDetail({ batch, onBack, onExport, onReuseBatch }: { batch: any, on
     setPracticeView('detail');
   };
 
-  const deletePractice = async (practiceId: number) => {
-    const ok = window.confirm('确认删除这次练习记录吗？删除后不可恢复。');
-    if (!ok) return;
-
+  // Step 1: show confirmation dialog by setting deletingPracticeId
+  const requestDeletePractice = (practiceId: number) => {
     setDeletingPracticeId(practiceId);
+  };
+
+  // Step 2: actually delete after user confirms in the dialog
+  const confirmDeletePractice = async () => {
+    const practiceId = deletingPracticeId;
+    if (practiceId === null) return;
+
     try {
       const res = await fetch(`/api/interviews/${practiceId}`, {
         method: 'DELETE',
@@ -1074,7 +1228,7 @@ function BatchDetail({ batch, onBack, onExport, onReuseBatch }: { batch: any, on
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        deletePractice(practice.id);
+                        requestDeletePractice(practice.id);
                       }}
                       disabled={deletingPracticeId === practice.id}
                       className="p-1 rounded-md text-zinc-400 hover:text-red-600 hover:bg-red-50 transition-colors disabled:opacity-50"
@@ -1102,7 +1256,7 @@ function BatchDetail({ batch, onBack, onExport, onReuseBatch }: { batch: any, on
                 </button>
                 {selectedPractice && (
                   <button
-                    onClick={() => deletePractice(selectedPractice.id)}
+                    onClick={() => requestDeletePractice(selectedPractice.id)}
                     disabled={deletingPracticeId === selectedPractice.id}
                     className="text-sm px-3 py-1.5 rounded-lg border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-50"
                   >
@@ -1128,6 +1282,43 @@ function BatchDetail({ batch, onBack, onExport, onReuseBatch }: { batch: any, on
           ))}
         </div>
       </div>
+
+      {/* Practice delete confirmation dialog */}
+      <AnimatePresence>
+        {deletingPracticeId !== null && (
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center p-6 bg-zinc-900/40 backdrop-blur-sm">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.95, opacity: 0, y: 20 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-white p-8 rounded-3xl shadow-2xl max-w-sm w-full border border-zinc-100 relative pointer-events-auto"
+            >
+              <div className="w-12 h-12 rounded-2xl bg-red-50 text-red-600 flex items-center justify-center mb-6">
+                <Trash2 className="w-6 h-6" />
+              </div>
+              <h3 className="text-xl font-bold text-zinc-900 mb-2">删除这次练习记录？</h3>
+              <p className="text-zinc-500 text-sm mb-8 leading-relaxed">
+                删除后不可恢复，确认要继续吗？
+              </p>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setDeletingPracticeId(null)}
+                  className="flex-1 py-3 rounded-xl border border-zinc-200 font-semibold text-zinc-600 hover:bg-zinc-50 transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={confirmDeletePractice}
+                  className="flex-1 py-3 rounded-xl bg-red-600 text-white font-semibold hover:bg-red-700 transition-colors shadow-lg shadow-red-600/20"
+                >
+                  确认删除
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
