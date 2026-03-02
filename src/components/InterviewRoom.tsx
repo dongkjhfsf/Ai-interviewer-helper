@@ -116,6 +116,8 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
   const hasReceivedAiAudioRef = useRef(false);
   // Delayed flush timer for user transcription — prevents tail truncation
   const turnCompleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Delayed flush timer for AI transcription — prevents tail truncation
+  const aiFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Session Resumption: 保存最新的恢复令牌，用于重连时恢复上下文
   const sessionResumeHandleRef = useRef<string | null>(null);
@@ -287,6 +289,11 @@ export default function InterviewRoom({ data, onEnd }: { data: any, onEnd: (tran
     if (turnCompleteTimerRef.current) {
       clearTimeout(turnCompleteTimerRef.current);
       turnCompleteTimerRef.current = null;
+    }
+    // Clear AI flush timer
+    if (aiFlushTimerRef.current) {
+      clearTimeout(aiFlushTimerRef.current);
+      aiFlushTimerRef.current = null;
     }
 
     // Clear reconnect countdown
@@ -799,7 +806,7 @@ ${questionsContext}
           flushPendingUserText();
           currentTurnRoleRef.current = null;
           turnCompleteTimerRef.current = null;
-        }, 400);
+        }, 800);
       }
     }
 
@@ -808,6 +815,13 @@ ${questionsContext}
       // If user text is pending (from before this model turn), flush it first
       // and show 'thinking' to indicate AI received the input and is processing
       if (currentTurnRoleRef.current !== 'model') {
+        // If there's a pending AI flush timer from a previous turn, execute it now
+        // before starting a new model turn to avoid mixing text from different turns
+        if (aiFlushTimerRef.current) {
+          clearTimeout(aiFlushTimerRef.current);
+          aiFlushTimerRef.current = null;
+          flushPendingAiText();
+        }
         flushPendingUserText(true);
         currentTurnRoleRef.current = 'model';
       }
@@ -831,12 +845,29 @@ ${questionsContext}
       pendingAiTextRef.current += sc.outputTranscription.text;
       // Update live preview so AI response text streams in real-time
       setLiveAiText(pendingAiTextRef.current);
+
+      // If a delayed AI flush timer is pending (from turnComplete), reset it
+      // so late-arriving transcription text is included in the final flush
+      if (aiFlushTimerRef.current) {
+        clearTimeout(aiFlushTimerRef.current);
+        aiFlushTimerRef.current = setTimeout(() => {
+          flushPendingAiText();
+          aiFlushTimerRef.current = null;
+        }, 800);
+      }
     }
 
     // Handle turn complete
     if (sc.turnComplete) {
-      // Flush AI text immediately (it's complete at this point)
-      flushPendingAiText();
+      // Delay AI text flush to allow late-arriving outputTranscription messages.
+      // The Gemini Live API sends transcription text asynchronously and messages
+      // may still be in-flight when turnComplete arrives — immediate flush causes
+      // tail truncation (the AI "says half and stops").
+      if (aiFlushTimerRef.current) clearTimeout(aiFlushTimerRef.current);
+      aiFlushTimerRef.current = setTimeout(() => {
+        flushPendingAiText();
+        aiFlushTimerRef.current = null;
+      }, 800);
 
       // Delay user text flush to allow late-arriving inputTranscription messages.
       // The Gemini Live API sends inputTranscription asynchronously and the last
@@ -846,7 +877,7 @@ ${questionsContext}
         flushPendingUserText();
         currentTurnRoleRef.current = null;
         turnCompleteTimerRef.current = null;
-      }, 400);
+      }, 800);
 
       // Calculate the actual remaining playback time so we don't cut off audio
       const ctx = playbackContextRef.current;

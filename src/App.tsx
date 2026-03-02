@@ -105,6 +105,7 @@ export default function App() {
         <QuestionList
           data={interviewData}
           onStart={() => setStep('interview')}
+          onBack={() => setStep('setup')}
         />
       )}
       {step === 'interview' && (

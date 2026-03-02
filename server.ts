@@ -603,6 +603,11 @@ async function startServer() {
             FROM interview_practices ip
             WHERE ip.batch_id = qb.id
           ) as practice_count,
+          (
+            SELECT MAX(ip2.created_at)
+            FROM interview_practices ip2
+            WHERE ip2.batch_id = qb.id
+          ) as last_practice_at,
           json_group_array(json_object(
             'id', q.id, 
             'content', q.content, 
@@ -638,7 +643,9 @@ async function startServer() {
         module_id: b.module_id,
         title: b.title || "Untitled Batch",
         questions: JSON.parse(b.questions_json),
-        practice_count: Number(b.practice_count || 0)
+        practice_count: Number(b.practice_count || 0),
+        // Normalize SQLite datetime ('YYYY-MM-DD HH:MM:SS') to ISO 8601 for reliable JS parsing
+        last_practice_at: b.last_practice_at ? String(b.last_practice_at).replace(' ', 'T') : null
       }));
 
       const formattedLegacy = legacy.map((b, i) => ({
@@ -729,6 +736,81 @@ async function startServer() {
       res.status(500).json({ error: "Failed to fetch interview practices" });
     }
   });
+
+  // ============================================================
+  // Individual Question Management Routes
+  // ============================================================
+
+  // Add a new question to a batch
+  app.post("/api/questions", (req, res) => {
+    try {
+      const { batchId, moduleId, content, difficulty, answer } = req.body;
+      if (!batchId || !moduleId || !content) {
+        return res.status(400).json({ error: "batchId, moduleId, and content are required" });
+      }
+
+      let parsedBatchId = batchId;
+      if (typeof batchId === 'string' && batchId.startsWith('legacy-')) {
+        // We cannot add questions to legacy batches as there is no real batch_id
+        return res.status(400).json({ error: "Cannot add questions to legacy batches" });
+      }
+
+      const result = db.prepare(`
+        INSERT INTO questions (batch_id, module_id, content, difficulty, answer)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(parsedBatchId, moduleId, content.trim(), difficulty, answer?.trim() || null);
+
+      res.json({ success: true, id: result.lastInsertRowid });
+    } catch (error) {
+      console.error("Error adding question:", error);
+      res.status(500).json({ error: "Failed to add question" });
+    }
+  });
+
+  // Update a question
+  app.put("/api/questions/:id", (req, res) => {
+    try {
+      const { id } = req.params;
+      const { content, difficulty, answer } = req.body;
+
+      if (!content || !content.trim()) {
+        return res.status(400).json({ error: "content is required" });
+      }
+
+      const result = db.prepare(`
+        UPDATE questions 
+        SET content = ?, difficulty = ?, answer = ?
+        WHERE id = ?
+      `).run(content.trim(), difficulty, answer?.trim() || null, id);
+
+      if (result.changes > 0) {
+        res.json({ success: true });
+      } else {
+        res.status(404).json({ error: "Question not found" });
+      }
+    } catch (error) {
+      console.error("Error updating question:", error);
+      res.status(500).json({ error: "Failed to update question" });
+    }
+  });
+
+  // Delete a question
+  app.delete("/api/questions/:id", (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = db.prepare("DELETE FROM questions WHERE id = ?").run(id);
+
+      if (result.changes > 0) {
+        res.json({ success: true });
+      } else {
+        res.status(404).json({ error: "Question not found" });
+      }
+    } catch (error) {
+      console.error("Error deleting question:", error);
+      res.status(500).json({ error: "Failed to delete question" });
+    }
+  });
+
 
   app.post("/api/interviews", (req, res) => {
     try {
